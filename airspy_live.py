@@ -4,8 +4,9 @@
 
 Requires: numpy, scipy, PySide6, pyqtgraph, libairspyhf, and jt9 on PATH.
 Decoder WAV files are written to /dev/shm and deleted after each decode.
-Decodes are appended to ALL.TXT in the current directory and shown in a scrollable
-decodes window. CQ decodes are highlighted there and can be marked on the waterfall.
+Decodes are appended to ALL.TXT in the current directory and shown in a pane at the
+bottom of the window, or in a separate window after "Pop out". CQ decodes are
+highlighted there and can be marked on the waterfall.
 
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
@@ -30,7 +31,7 @@ import scipy.fft as sfft
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.4.1"
+VERSION = "0.6.1"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -40,7 +41,10 @@ MAX_DISPLAY_COLS = 2048
 RING_SECONDS = 17               # ring must hold a full 15 s FT8 slot plus margin
 HEADROOM_DB = 40.0              # colour range above the calibrated top
 SETTLE_S = 0.25                 # discard samples after a retune
-DECODE_HISTORY_LINES = 10000    # scrollback kept in the decodes window
+BG_HISTORY_S = 10.0             # noise-floor estimate window
+LEVELS_MIN_ROWS = 10            # waterfall rows needed before colour levels are fixed
+DECODE_PANE_HEIGHT = 170        # initial height of the docked decodes pane, px
+DECODE_HISTORY_LINES = 10000    # scrollback kept in the decodes pane
 
 STEPS = [("1 Hz", 1), ("10 Hz", 10), ("50 Hz", 50), ("100 Hz", 100),
          ("500 Hz", 500), ("1 kHz", 1000), ("2 kHz", 2000),
@@ -49,12 +53,12 @@ DEFAULT_STEP_INDEX = 5          # 1 kHz
 
 SPAN_PRESETS = [
     ("CW 500 Hz", 0.5),
-    ("CW 2.4 kHz", 2.4),
     ("SSB 2.7 kHz", 2.7),
     ("SSB 3 kHz", 3.0),
     ("SSB 6 kHz", 6.0),
-    ("20m FT8 segment 3 kHz", 3.0),
-    ("FT8 band 350 kHz", 350.0),
+    ("20 kHz", 20.0),
+    ("100 kHz", 100.0),
+    ("350 kHz", 350.0),
 ]
 
 # FT8 decoding
@@ -64,7 +68,7 @@ FT8_AUDIO_RATE = 12_000
 FT8_AUDIO_LEN = FT8_SLOT_S * FT8_AUDIO_RATE     # 180000 samples
 FT8_AUDIO_CENTER = 2100.0                       # centre of the 200-4000 Hz decode band
 FT8_AUDIO_MAX_SPAN = 3800.0                     # widest displayed range that can be decoded
-JT9_ARGS = ["-8", "-d", "3"]                    # add options from `jt9 --help` if needed
+JT9_ARGS = ["-8", "-d", "3", "-f", "2100"]     # receive offset: centre of the decode band
 DECODE_RE = re.compile(r"^\s*(?:\d{6}\s+)?(-?\d+)\s+(-?\d+\.\d+)\s+(\d+(?:\.\d+)?)\s+~\s+(.*\S)\s*$")
 
 MARK_RGBA_CQ = (200, 200, 200, 255)
@@ -193,7 +197,7 @@ class Receiver:
 # ------------------------------------------------------------ DSP
 
 class Analyzer:
-    def __init__(self, ring, rate, nfft, avg_s=1.0, bg_s=30.0):
+    def __init__(self, ring, rate, nfft, avg_s=1.0, bg_s=BG_HISTORY_S):
         self.ring = ring
         self.rate = rate
         self.nfft = nfft
@@ -202,10 +206,11 @@ class Analyzer:
         self.max_frames = max(1, 2_000_000 // nfft)
         self.freqs = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / rate))
         row_s = self.hop / rate
+        self.rows_per_s = rate / self.hop
         self.alpha = min(1.0, row_s / max(avg_s, row_s))   # time-average weight
         self.bg_on = bg_s > 0
         self.bg_s = bg_s
-        self.dec = max(1, int(round((rate / self.hop) / 10)))  # keep ~10 history rows/s
+        self.dec = max(1, int(round(self.rows_per_s / 10)))  # keep ~10 history rows/s, at least 1 per row
         self.next_pos = None
         self.ema = None
         self.bg_db = 0.0
@@ -229,7 +234,9 @@ class Analyzer:
         self.hist_pos = 0
         self.row_count = 0
         if self.bg_on:
-            self.hist = np.zeros((max(1, int(self.bg_s * 10)), len(self.freq_khz)), np.float32)
+            # history length in entries = bg_s seconds of entries stored every `dec` rows
+            hist_len = max(1, int(round(self.bg_s * self.rows_per_s / self.dec)))
+            self.hist = np.zeros((hist_len, len(self.freq_khz)), np.float32)
         if settle_s > 0:
             self.next_pos = self.ring.total + int(settle_s * self.rate)
         else:
@@ -367,14 +374,13 @@ class DecodeBridge(QtCore.QObject):
 # ------------------------------------------------------------ GUI
 
 class DecodeWindow(QtWidgets.QWidget):
-    """Separate scrollable window holding recent FT8 decodes. CQ lines are highlighted."""
+    """Scrollable list of recent FT8 decodes. CQ lines are highlighted."""
 
     CQ_BG = QtGui.QColor(31, 92, 46)
     CQ_FG = QtGui.QColor(240, 255, 240)
 
-    def __init__(self, parent):
-        super().__init__(parent, QtCore.Qt.Window)
-        self.setWindowTitle("FT8 decodes")
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.view = QtWidgets.QTextEdit()
         self.view.setReadOnly(True)
         self.view.document().setMaximumBlockCount(DECODE_HISTORY_LINES)
@@ -384,8 +390,8 @@ class DecodeWindow(QtWidgets.QWidget):
         self.view.setFont(font)
         self.view.setPlaceholderText("FT8 decodes appear here and in ALL.TXT")
         lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
         lay.addWidget(self.view)
-        self.resize(900, 500)
 
     def append(self, line, is_cq):
         sb = self.view.verticalScrollBar()
@@ -403,6 +409,27 @@ class DecodeWindow(QtWidgets.QWidget):
         cur.insertText(line, fmt)
         if at_bottom:
             sb.setValue(sb.maximum())
+
+
+class DecodePopout(QtWidgets.QWidget):
+    """Free-floating decodes window. Closing it reports back so the pane can re-dock."""
+
+    closed = QtCore.Signal()
+
+    def __init__(self):
+        super().__init__(None, QtCore.Qt.Window)
+        self.setWindowTitle("FT8 decodes")
+        self.btn_dock = QtWidgets.QPushButton("Dock")
+        top = QtWidgets.QHBoxLayout()
+        top.addStretch(1)
+        top.addWidget(self.btn_dock)
+        self.lay = QtWidgets.QVBoxLayout(self)
+        self.lay.addLayout(top)
+        self.resize(700, 400)
+
+    def closeEvent(self, ev):
+        self.closed.emit()
+        ev.accept()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -443,13 +470,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bridge.status.connect(self._on_decode_status)
         self.bridge.done.connect(self._on_decode_done)
 
-        self.decode_win = DecodeWindow(self)
-
         self.spec = pg.PlotWidget(title="Spectrum")
         self.spec.setLabel("left", "SNR", units="dB")
         self.spec.setLabel("bottom", "Frequency", units="kHz")
         self.spec.getAxis("bottom").enableAutoSIPrefix(False)
-        self.spec.setYRange(-5, 25, padding=0)
+        self.spec.setYRange(-5, 40, padding=0)
         self.spec_curve = self.spec.plot(pen="y")
 
         self.wf_plot = pg.PlotWidget(title="Waterfall (newest at top)")
@@ -468,8 +493,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_up = QtWidgets.QPushButton("▲ Up")
         self.btn_down = QtWidgets.QPushButton("▼ Down")
         self.btn_save = QtWidgets.QPushButton("Save PNG")
-        self.btn_decodes = QtWidgets.QPushButton("Decodes window")
-        self.btn_marks = QtWidgets.QPushButton("Mark decodes")
+        self.btn_popout = QtWidgets.QPushButton("Pop out")
+        self.btn_marks = QtWidgets.QPushButton("Mark")
         self.btn_marks.setCheckable(True)
         self.btn_marks.setChecked(True)                 # on by default
         self.show_marks = True
@@ -495,7 +520,7 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(self.span_box)
         controls.addWidget(self.btn_save)
         controls.addWidget(self.chk_decode)
-        controls.addWidget(self.btn_decodes)
+        controls.addWidget(self.btn_popout)
         controls.addWidget(self.btn_marks)
         controls.addStretch(1)
         self.tune_label = QtWidgets.QLabel()
@@ -506,10 +531,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.step_box.currentIndexChanged.connect(self.on_step)
         self.span_box.currentIndexChanged.connect(self.on_span)
         self.btn_save.clicked.connect(self.save_png)
-        self.btn_decodes.clicked.connect(self.show_decodes)
+        self.btn_popout.clicked.connect(self.pop_out)
         self.btn_marks.toggled.connect(self._set_marks_visible)
 
-        # --- one status line: radio/FFT info, decode window, transient messages, version
+        # --- one status line: radio/FFT info, transient messages, version
         self.status = QtWidgets.QLabel()
         self.msg = QtWidgets.QLabel()
         self.version_label = QtWidgets.QLabel(f"v{VERSION}")
@@ -533,6 +558,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         self.resize(1200, 900)
 
+        # --- decodes: docked along the bottom, or popped out into its own window
+        self.decode_pane = DecodeWindow()
+        self.decode_dock = QtWidgets.QDockWidget("FT8 decodes", self)
+        self.decode_dock.setObjectName("decodes_dock")
+        self.decode_dock.setWidget(self.decode_pane)
+        self.decode_dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.decode_dock)
+        self.resizeDocks([self.decode_dock], [DECODE_PANE_HEIGHT],
+                         QtCore.Qt.Orientation.Vertical)
+
+        self.popout = DecodePopout()
+        self.popout.btn_dock.clicked.connect(self.dock_back)
+        self.popout.closed.connect(self.dock_back)
+        self.popped = False             # True while the history lives in the popout window
+
         self._configure(settle=False)
         self._refresh()
 
@@ -540,7 +582,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(30)
 
-        self.decode_win.show()                          # open by default
+    # ---- decodes pane: pop out / dock back
+    def pop_out(self):
+        if not self.popped:
+            self.popout.lay.addWidget(self.decode_pane.view)   # moves the history widget
+            self.popped = True
+            self.decode_dock.hide()
+        self.popout.show()
+        self.popout.raise_()
+        self.popout.activateWindow()
+
+    def dock_back(self):
+        if not self.popped:
+            return
+        self.decode_pane.layout().addWidget(self.decode_pane.view)   # moves the history back
+        self.popped = False
+        self.popout.hide()
+        self.decode_dock.show()
+        self.decode_dock.raise_()
 
     # ---- span selection helpers
     def _select_span(self, khz):
@@ -618,11 +677,6 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.msg.setText("Save failed")
 
-    def show_decodes(self):
-        self.decode_win.show()
-        self.decode_win.raise_()
-        self.decode_win.activateWindow()
-
     def _set_marks_visible(self, on):
         self.show_marks = on
         if not on and self.ov is not None:
@@ -668,7 +722,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_decode(self, rec):
         is_cq = rec["msg"].startswith("CQ ")
-        self.decode_win.append(rec["line"], is_cq)
+        self.decode_pane.append(rec["line"], is_cq)
         try:
             with open(self.all_txt, "a") as f:
                 f.write(rec["line"] + "\n")
@@ -792,7 +846,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.newest_s = self.an.next_pos - self.an.hop
             self.valid_rows = min(self.valid_rows + k, self.rows)
 
-            if self.levels is None and self.valid_rows >= 50:
+            if self.levels is None and self.valid_rows >= LEVELS_MIN_ROWS:
                 v = self.wf[-self.valid_rows:][::2, ::4]     # valid data only
                 lo, hi = np.percentile(v, [5, 99.5])
                 hi = max(float(hi), float(lo) + 1.0)
