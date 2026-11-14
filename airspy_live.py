@@ -8,6 +8,8 @@ Decodes are appended to ALL.TXT in the current directory and shown in a pane at 
 bottom of the window, or in a separate window after "Pop out". CQ decodes are
 highlighted there and can be marked on the waterfall.
 
+-J.Beale N8JUF  14-Nov-2025
+
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
     ./airspy_live.py -f 14.074 --span 3 --rate 192000
@@ -17,6 +19,7 @@ import argparse
 import ctypes
 import ctypes.util
 import os
+import math
 import re
 import shutil
 import subprocess
@@ -24,6 +27,7 @@ import sys
 import threading
 import time
 import wave
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -31,7 +35,7 @@ import scipy.fft as sfft
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.6.1"
+VERSION = "0.12.0"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -41,10 +45,16 @@ MAX_DISPLAY_COLS = 2048
 RING_SECONDS = 17               # ring must hold a full 15 s FT8 slot plus margin
 HEADROOM_DB = 40.0              # colour range above the calibrated top
 SETTLE_S = 0.25                 # discard samples after a retune
-BG_HISTORY_S = 10.0             # noise-floor estimate window
+BG_TAU_S = 60.0                 # background tracker time constant
+BG_GATE_DB = 6.0                # bins this far above the background are treated as signal
+BG_GATE_MAX_S = 120.0           # a bin held above the gate this long is taken as new background
+SPEC_AVG_S = 15.0                # time constant of the averaged spectrum trace
 LEVELS_MIN_ROWS = 10            # waterfall rows needed before colour levels are fixed
 DECODE_PANE_HEIGHT = 170        # initial height of the docked decodes pane, px
 DECODE_HISTORY_LINES = 10000    # scrollback kept in the decodes pane
+RATE_WINDOW_S = 15 * 60         # decode-rate window: most recent 15 minutes
+RATE_MIN_SPAN_S = 60.0          # below this much elapsed time the rate is shown as "--"
+MY_GRID = "CN85"                # own Maidenhead grid square, for distances in the hover popup
 
 STEPS = [("1 Hz", 1), ("10 Hz", 10), ("50 Hz", 50), ("100 Hz", 100),
          ("500 Hz", 500), ("1 kHz", 1000), ("2 kHz", 2000),
@@ -52,26 +62,41 @@ STEPS = [("1 Hz", 1), ("10 Hz", 10), ("50 Hz", 50), ("100 Hz", 100),
 DEFAULT_STEP_INDEX = 5          # 1 kHz
 
 SPAN_PRESETS = [
-    ("CW 500 Hz", 0.5),
-    ("SSB 2.7 kHz", 2.7),
-    ("SSB 3 kHz", 3.0),
-    ("SSB 6 kHz", 6.0),
+    ("500 Hz", 0.5),
+    ("3 kHz", 3.0),
+    ("6 kHz", 6.0),
     ("20 kHz", 20.0),
     ("100 kHz", 100.0),
     ("350 kHz", 350.0),
 ]
 
-# FT8 decoding
-FT8_SLOT_S = 15
-FT8_TONE_BW_HZ = 50.0                           # occupied bandwidth of one FT8 signal
+BANDS = [
+    # (name, standard FT8 dial MHz, standard FT4 dial MHz or None); 6 m is left out
+    # because it is outside the tuning range check
+    ("160 m", 1.840, None), ("80 m", 3.573, 3.575), ("60 m", 5.357, None),
+    ("40 m", 7.074, 7.0475), ("30 m", 10.136, 10.140), ("20 m", 14.074, 14.080),
+    ("17 m", 18.100, 18.104), ("15 m", 21.074, 21.140), ("12 m", 24.915, 24.919),
+    ("10 m", 28.074, 28.180),
+]
+BAND_SPAN_KHZ = 3.0             # display width when a band is selected, as at startup
+
+# Decoding: one mode at a time, via WSJT-X's jt9
 FT8_AUDIO_RATE = 12_000
-FT8_AUDIO_LEN = FT8_SLOT_S * FT8_AUDIO_RATE     # 180000 samples
 FT8_AUDIO_CENTER = 2100.0                       # centre of the 200-4000 Hz decode band
 FT8_AUDIO_MAX_SPAN = 3800.0                     # widest displayed range that can be decoded
-JT9_ARGS = ["-8", "-d", "3", "-f", "2100"]     # receive offset: centre of the decode band
+MODES = {
+    # slot_s: transmit cycle; tone_bw: occupied bandwidth of one signal; jt9: decoder arguments;
+    # dial_mhz: normal calling frequency; lo/hi: display window (kHz) selected with the mode
+    "FT8": {"slot_s": 15.0, "tone_bw": 50.0, "jt9": ["-8", "-d", "3", "-f", "2100"],
+            "dial_mhz": 14.074, "lo": 14074.0, "hi": 14077.0},
+    "FT4": {"slot_s": 7.5, "tone_bw": 90.0, "jt9": ["-4", "-d", "3", "-f", "2100"],
+            "dial_mhz": 14.080, "lo": 14080.0, "hi": 14083.0},
+}
 DECODE_RE = re.compile(r"^\s*(?:\d{6}\s+)?(-?\d+)\s+(-?\d+\.\d+)\s+(\d+(?:\.\d+)?)\s+~\s+(.*\S)\s*$")
 
-MARK_RGBA_CQ = (200, 200, 200, 255)
+ANN_RE = re.compile(r"^(.*?)((?:\s+\?)?(?:\s+a\d+)?)\s*$")   # message, then optional jt9 tag
+
+MARK_RGBA_CQ = (183, 65, 14, 255)               # rust red: not a viridis colour
 MARK_RGBA_OTHER = (130, 130, 130, 255)
 
 # ---------------------------------------------------------------- libairspyhf
@@ -197,7 +222,7 @@ class Receiver:
 # ------------------------------------------------------------ DSP
 
 class Analyzer:
-    def __init__(self, ring, rate, nfft, avg_s=1.0, bg_s=BG_HISTORY_S):
+    def __init__(self, ring, rate, nfft, avg_s=1.0):
         self.ring = ring
         self.rate = rate
         self.nfft = nfft
@@ -205,19 +230,17 @@ class Analyzer:
         self.win = np.hanning(nfft).astype(np.float32)
         self.max_frames = max(1, 2_000_000 // nfft)
         self.freqs = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / rate))
-        row_s = self.hop / rate
-        self.rows_per_s = rate / self.hop
-        self.alpha = min(1.0, row_s / max(avg_s, row_s))   # time-average weight
-        self.bg_on = bg_s > 0
-        self.bg_s = bg_s
-        self.dec = max(1, int(round(self.rows_per_s / 10)))  # keep ~10 history rows/s, at least 1 per row
+        self.row_s = self.hop / rate                                 # seconds per waterfall row
+        self.alpha = min(1.0, self.row_s / max(avg_s, self.row_s))   # time-average weight
         self.next_pos = None
-        self.ema = None
-        self.bg_db = 0.0
-        self.hist = None
-        self.hist_n = 0
-        self.hist_pos = 0
-        self.row_count = 0
+        self.ema = None         # time-averaged power, per bin
+        self.bg = None          # background level, dB, per bin
+        self.gated_s = None     # seconds each bin has spent above the gate
+        self.n_rows = 0         # rows since configure()
+        self.raw = True        # True: absolute power; False: power above background (SNR)
+        self.ema_long = None    # longer time average of power, for the averaged spectrum trace
+        self.long_alpha = min(1.0, self.row_s / max(SPEC_AVG_S, self.row_s))
+        self.spec_avg_db = None
         self.keep = None
         self.group = 1
         self.freq_khz = None
@@ -229,14 +252,10 @@ class Analyzer:
         self.group = max(1, int(np.ceil(nb / MAX_DISPLAY_COLS)))
         self.freq_khz = self.reduce((tune_hz + self.freqs[self.keep]) / 1e3)
         self.ema = None
-        self.bg_db = 0.0
-        self.hist_n = 0
-        self.hist_pos = 0
-        self.row_count = 0
-        if self.bg_on:
-            # history length in entries = bg_s seconds of entries stored every `dec` rows
-            hist_len = max(1, int(round(self.bg_s * self.rows_per_s / self.dec)))
-            self.hist = np.zeros((hist_len, len(self.freq_khz)), np.float32)
+        self.bg = None
+        self.gated_s = None
+        self.n_rows = 0
+        self.ema_long = None
         if settle_s > 0:
             self.next_pos = self.ring.total + int(settle_s * self.rate)
         else:
@@ -275,31 +294,44 @@ class Analyzer:
 
         if self.ema is None:
             self.ema = pr[0].copy()
+        if self.ema_long is None:
+            self.ema_long = self.ema.copy()
         out = np.empty_like(pr)
+        bgs = np.empty_like(pr)
         for i in range(pr.shape[0]):
             self.ema += self.alpha * (pr[i] - self.ema)      # time average
+            self.ema_long += self.long_alpha * (pr[i] - self.ema_long)
+            x = 10 * np.log10(self.ema + 1e-20)
+            if self.bg is None:
+                self.bg = x.copy()
+                self.gated_s = np.zeros_like(x)
+            self.n_rows += 1
+            # Bins well above the background are treated as signal and do not move it, so the
+            # background is unchanged when a signal ends. A bin held above the gate long enough
+            # is accepted as a genuine new background.
+            above = x > self.bg + BG_GATE_DB
+            self.gated_s = np.where(above, self.gated_s + self.row_s, 0.0)
+            move = ~above | (self.gated_s > BG_GATE_MAX_S)
+            w = max(self.row_s / BG_TAU_S, 1.0 / self.n_rows)   # running mean until BG_TAU_S is reached
+            self.bg = np.where(move, self.bg + w * (x - self.bg), self.bg)
             out[i] = self.ema
-            if self.bg_on:
-                self.row_count += 1
-                if self.row_count % self.dec == 0:
-                    self.hist[self.hist_pos] = self.ema
-                    self.hist_pos = (self.hist_pos + 1) % self.hist.shape[0]
-                    self.hist_n = min(self.hist_n + 1, self.hist.shape[0])
+            bgs[i] = self.bg
 
-        if self.bg_on and self.hist_n:
-            bg = np.percentile(self.hist[:self.hist_n], 20, axis=0)   # noise-floor estimate
-            self.bg_db = 10 * np.log10(bg + 1e-20)
-
-        rows_db = 10 * np.log10(out + 1e-20) - self.bg_db
-        spec_db = 10 * np.log10(self.ema + 1e-20) - self.bg_db
+        if self.raw:
+            rows_db = 10 * np.log10(out + 1e-20)
+            spec_db = 10 * np.log10(self.ema + 1e-20)
+        else:
+            rows_db = 10 * np.log10(out + 1e-20) - bgs
+            spec_db = 10 * np.log10(self.ema + 1e-20) - self.bg
+        self.spec_avg_db = 10 * np.log10(self.ema_long + 1e-20) - (0.0 if self.raw else self.bg)
         return rows_db.astype(np.float32), spec_db
 
 # ------------------------------------------------------------ FT8 decoding
 
-def make_ft8_wav(z, rate, disp_off, span_hz, path):
-    """Demodulate the displayed band to 12 kHz USB-style audio and write a 15 s mono WAV.
+def make_wav(z, rate, disp_off, span_hz, path, audio_len):
+    """Demodulate the displayed band to 12 kHz USB-style audio and write a mono WAV of audio_len samples.
 
-    z must hold exactly FT8_SLOT_S * rate complex samples. The displayed band is centred
+    z must hold exactly one slot of complex samples. The displayed band is centred
     on 2100 Hz audio, clipped to 3.8 kHz, so audio freq = 2100 + (RF offset - display centre).
     """
     n_in = z.size
@@ -307,7 +339,7 @@ def make_ft8_wav(z, rate, disp_off, span_hz, path):
     m = min(span_hz, FT8_AUDIO_MAX_SPAN)
     a_lo = FT8_AUDIO_CENTER - m / 2
     a_hi = FT8_AUDIO_CENTER + m / 2
-    M = FT8_AUDIO_LEN
+    M = audio_len
     b = np.arange(int(np.ceil(a_lo * M / FT8_AUDIO_RATE)),
                   int(np.floor(a_hi * M / FT8_AUDIO_RATE)) + 1)
     a = b * FT8_AUDIO_RATE / M
@@ -327,20 +359,78 @@ def make_ft8_wav(z, rate, disp_off, span_hz, path):
         w.writeframes(pcm.tobytes())
 
 
-def format_all_line(slot_time, dial_hz, snr, dt, audio_hz, msg):
+def format_all_line(slot_time, dial_hz, snr, dt, audio_hz, msg, mode):
     """One ALL.TXT line in WSJT-X's layout (verify column widths against a real ALL.TXT)."""
     ts = time.strftime("%y%m%d_%H%M%S", time.gmtime(slot_time))
-    return (f"{ts}  {dial_hz / 1e6:9.3f} Rx FT8  {snr:4d}  {dt:4.1f} "
+    return (f"{ts}  {dial_hz / 1e6:9.3f} Rx {mode}  {snr:4d}  {dt:4.1f} "
             f"{int(round(audio_hz)):4d} ~  {msg}")
 
 
-def run_decode(z, rate, slot_time, tune_hz, disp_off, span_hz, jt9_path, shm_dir):
-    """Write the slot WAV to shared memory, run jt9, and return decode records."""
+GRID_RE = re.compile(r"^[A-R]{2}[0-9]{2}(?:[A-X]{2})?$")
+CALL_TOKEN_RE = re.compile(r"^[A-Z0-9/]{3,}$")
+
+
+def is_callsign(tok):
+    return (CALL_TOKEN_RE.match(tok) is not None
+            and any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok)
+            and GRID_RE.match(tok) is None)
+
+
+def sending_call(msg):
+    """Callsign of the station that sent a decoded message, or None (e.g. hashed calls)."""
+    toks = msg.split()
+    if len(toks) < 2:
+        return None
+    if toks[0] == "CQ":                                  # CQ [modifier] CALL [GRID]
+        cands = [t for t in toks[1:] if is_callsign(t)]
+        tok = cands[0] if cands else None
+    else:                                                # TO FROM [REPORT|GRID|RR73|73]
+        tok = toks[1]
+    return tok if tok is not None and is_callsign(tok) else None
+
+
+def sending_grid(msg):
+    """Grid square sent by the station that sent a decoded message, or None."""
+    toks = msg.split()
+    if len(toks) < 3 or toks[-1] == "RR73" or GRID_RE.match(toks[-1]) is None:
+        return None
+    return toks[-1]
+
+
+EARTH_RADIUS_MI = 3958.8
+
+
+def grid_center(grid):
+    """(lat, lon) in degrees of the centre of a 4- or 6-character Maidenhead grid."""
+    g = grid.upper()
+    lon = (ord(g[0]) - 65) * 20 - 180 + int(g[2]) * 2
+    lat = (ord(g[1]) - 65) * 10 - 90 + int(g[3])
+    if len(g) == 6:
+        lon += (ord(g[4]) - 65) * 5 / 60 + 2.5 / 60
+        lat += (ord(g[5]) - 65) * 2.5 / 60 + 1.25 / 60
+    else:
+        lon += 1
+        lat += 0.5
+    return lat, lon
+
+
+def grid_distance_miles(grid_a, grid_b):
+    """Great-circle distance in miles between the centres of two grid squares."""
+    lat1, lon1 = (math.radians(v) for v in grid_center(grid_a))
+    lat2, lon2 = (math.radians(v) for v in grid_center(grid_b))
+    h = (math.sin((lat2 - lat1) / 2) ** 2
+         + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
+    return 2 * EARTH_RADIUS_MI * math.asin(math.sqrt(h))
+
+
+def run_decode(z, rate, slot_time, tune_hz, disp_off, span_hz, jt9_path, shm_dir, mode):
+    """Write the slot WAV to shared memory, run jt9 in the given mode, and return decode records."""
+    m = MODES[mode]
     stamp = time.strftime("%y%m%d_%H%M%S", time.gmtime(slot_time))
     path = os.path.join(shm_dir, stamp + ".wav")
-    make_ft8_wav(z, rate, disp_off, span_hz, path)
+    make_wav(z, rate, disp_off, span_hz, path, int(round(m["slot_s"] * FT8_AUDIO_RATE)))
     try:
-        proc = subprocess.run([jt9_path] + JT9_ARGS + [path],
+        proc = subprocess.run([jt9_path] + m["jt9"] + [path],
                               capture_output=True, text=True, timeout=120)
         text = proc.stdout
     finally:
@@ -353,13 +443,22 @@ def run_decode(z, rate, slot_time, tune_hz, disp_off, span_hz, jt9_path, shm_dir
         m = DECODE_RE.match(ln)
         if not m:
             continue
-        snr, dt, a_hz, msg = m.groups()
-        msg = msg.strip()
+        snr, dt, a_hz, raw = m.groups()
+        # jt9 pads the message and may add a decoder tag ("a1", "? a1"); keep the tag on the
+        # displayed line only, so the message itself is clean for parsing and highlighting
+        ann_m = ANN_RE.match(raw.strip())
+        msg = " ".join(ann_m.group(1).split())
+        full = " ".join(filter(None, [msg, " ".join(ann_m.group(2).split())]))
         audio = disp_off + (float(a_hz) - FT8_AUDIO_CENTER)   # Hz relative to tuned frequency
         recs.append({
             "slot": slot_time,
-            "line": format_all_line(slot_time, tune_hz, int(snr), float(dt), audio, msg),
+            "mode": mode,
+            "line": format_all_line(slot_time, tune_hz, int(snr), float(dt), audio, full, mode),
             "msg": msg,
+            "call": sending_call(msg),
+            "grid": sending_grid(msg),
+            "snr": int(snr),
+            "offset": int(round(audio)),                      # same audio offset as the waterfall axis
             "rf_hz": tune_hz + audio,                         # absolute RF of the tone start
         })
     return recs
@@ -374,29 +473,74 @@ class DecodeBridge(QtCore.QObject):
 # ------------------------------------------------------------ GUI
 
 class DecodeWindow(QtWidgets.QWidget):
-    """Scrollable list of recent FT8 decodes. CQ lines are highlighted."""
+    """Scrollable FT8 decodes: one pane, or two (CQ calls above other messages). CQ lines are highlighted."""
 
     CQ_BG = QtGui.QColor(31, 92, 46)
     CQ_FG = QtGui.QColor(240, 255, 240)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.view = QtWidgets.QTextEdit()
-        self.view.setReadOnly(True)
-        self.view.document().setMaximumBlockCount(DECODE_HISTORY_LINES)
-        self.view.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.NoWrap)
-        font = QtGui.QFont("monospace")
-        font.setStyleHint(QtGui.QFont.StyleHint.Monospace)
-        self.view.setFont(font)
+        # The single pane holds everything; the two split panes get their own subsets.
+        # Every decode is appended to the single pane and to one split pane, so switching
+        # modes shows the full history.
+        self.view = self._make_view()
         self.view.setPlaceholderText("FT8 decodes appear here and in ALL.TXT")
+        self.view_cq = self._make_view()
+        self.view_other = self._make_view()
+
+        self.split_box = QtWidgets.QWidget()
+        split_lay = QtWidgets.QVBoxLayout(self.split_box)
+        split_lay.setContentsMargins(0, 0, 0, 0)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        for title, view in (("CQ calls", self.view_cq), ("Other messages", self.view_other)):
+            pane = QtWidgets.QWidget()
+            pl = QtWidgets.QVBoxLayout(pane)
+            pl.setContentsMargins(0, 0, 0, 0)
+            pl.setSpacing(0)
+            pl.addWidget(QtWidgets.QLabel(title))
+            pl.addWidget(view)
+            splitter.addWidget(pane)
+        split_lay.addWidget(splitter)
+        self.split_box.hide()
+
+        self.btn_split = QtWidgets.QPushButton("Two panes")
+        self.btn_split.setCheckable(True)
+        self.btn_split.toggled.connect(self._set_split)
+        self.top_bar = QtWidgets.QWidget()           # hidden while popped out; the button moves to that window
+        top = QtWidgets.QHBoxLayout(self.top_bar)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addStretch(1)
+        top.addWidget(self.btn_split)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
+        lay.addWidget(self.top_bar)
         lay.addWidget(self.view)
+        lay.addWidget(self.split_box)
+
+    @staticmethod
+    def _make_view():
+        view = QtWidgets.QTextEdit()
+        view.setReadOnly(True)
+        view.document().setMaximumBlockCount(DECODE_HISTORY_LINES)
+        view.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.NoWrap)
+        font = QtGui.QFont("monospace")
+        font.setStyleHint(QtGui.QFont.StyleHint.Monospace)
+        view.setFont(font)
+        return view
+
+    def _set_split(self, on):
+        self.view.setVisible(not on)
+        self.split_box.setVisible(on)
+        self.btn_split.setText("Single pane" if on else "Two panes")
 
     def append(self, line, is_cq):
-        sb = self.view.verticalScrollBar()
+        self._append_to(self.view, line, is_cq)
+        self._append_to(self.view_cq if is_cq else self.view_other, line, is_cq)
+
+    def _append_to(self, view, line, is_cq):
+        sb = view.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 4
-        cur = self.view.textCursor()
+        cur = view.textCursor()
         cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
         if cur.position() > 0:
             cur.setCharFormat(QtGui.QTextCharFormat())   # plain formatting for the new block
@@ -420,16 +564,28 @@ class DecodePopout(QtWidgets.QWidget):
         super().__init__(None, QtCore.Qt.Window)
         self.setWindowTitle("FT8 decodes")
         self.btn_dock = QtWidgets.QPushButton("Dock")
-        top = QtWidgets.QHBoxLayout()
-        top.addStretch(1)
-        top.addWidget(self.btn_dock)
+        self.top = QtWidgets.QHBoxLayout()
+        self.top.addStretch(1)
+        self.top.addWidget(self.btn_dock)
         self.lay = QtWidgets.QVBoxLayout(self)
-        self.lay.addLayout(top)
+        self.lay.addLayout(self.top)
         self.resize(700, 400)
 
     def closeEvent(self, ev):
         self.closed.emit()
         ev.accept()
+
+
+class AudioOffsetAxis(pg.AxisItem):
+    """Top axis of the waterfall: audio offset in Hz from the tuned (dial) frequency."""
+
+    def __init__(self):
+        super().__init__("top")
+        self.tune_hz = 0.0
+        self.enableAutoSIPrefix(False)
+
+    def tickStrings(self, values, scale, spacing):
+        return [f"{v * 1e3 - self.tune_hz:.0f}" for v in values]     # values are in kHz
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -451,16 +607,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg_version = 0            # bumped on retune/span change
         self.cur_slot = None            # (boundary_time, sample_index, cfg_version)
         self.decoding = False
+        self.decode_times = deque()     # slot start times of decodes in the rate window
+        self.decode_t0 = None           # when decoding was switched on; None while off
+        self.mode = None                # "FT8", "FT4", or None for decoding off
+        self.manual_tuned = False       # True once the user has retuned or changed the span
 
         # Decode marks are drawn into the waterfall's own pixel buffer. Each mark records the
         # sample range of its slot, so it scrolls on the same clock as the waterfall rows.
         self.marks = []                 # [{"s0", "s1", "cq", "x0", "w"}]
         self.show_marks = True
+        self.grids = {}                 # session: callsign -> last grid square heard from it
         self.ov = None                  # overlay codes, same shape as wf: 0 none, 1 other, 2 CQ
         self.newest_s = None            # sample index of the newest waterfall row's start
         self.dirty = False              # set when the image needs rebuilding
 
         self.levels = (vmin, vmax) if (vmin is not None and vmax is not None) else None
+        self.fixed_levels = self.levels     # user-given colour range, in SNR units
         self.rows = 0
         self.valid_rows = 0
         self.wf = None
@@ -475,13 +637,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spec.setLabel("bottom", "Frequency", units="kHz")
         self.spec.getAxis("bottom").enableAutoSIPrefix(False)
         self.spec.setYRange(-5, 40, padding=0)
-        self.spec_curve = self.spec.plot(pen="y")
+        self.spec.addLegend(offset=(-10, 10))
+        self.spec_curve = self.spec.plot(pen="y", name="Live")
+        self.spec_avg_curve = self.spec.plot(pen=pg.mkPen((0, 200, 255), width=2),
+                                             name="15 s average")
 
-        self.wf_plot = pg.PlotWidget(title="Waterfall (newest at top)")
+        self.wf_plot = pg.PlotWidget(axisItems={"top": AudioOffsetAxis()})
         self.wf_plot.setLabel("bottom", "Frequency", units="kHz")
         self.row_s = an.hop / self.rate             # seconds per waterfall row
         self.wf_plot.setLabel("left", "Time relative to now", units="s")
         self.wf_plot.getAxis("bottom").enableAutoSIPrefix(False)
+        self.off_axis = self.wf_plot.getAxis("top")
+        self.wf_plot.setLabel("top", "Audio offset", units="Hz")
+        self.wf_plot.showAxis("top")
         self.wf_plot.setXLink(self.spec)
         self.wf_plot.setMouseEnabled(x=False, y=False)
         self.img = pg.ImageItem()
@@ -498,9 +666,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_marks.setCheckable(True)
         self.btn_marks.setChecked(True)                 # on by default
         self.show_marks = True
-        self.chk_decode = QtWidgets.QCheckBox("Decode FT8")
-        self.chk_decode.setChecked(decode_start and decode_ok)
-        self.chk_decode.setEnabled(decode_ok)
+        self.btn_calls = QtWidgets.QPushButton("Call")
+        self.btn_calls.setCheckable(True)
+        self.btn_calls.setChecked(True)                 # on by default, as Mark
+        self.show_call = True
+        self.mode_group = QtWidgets.QButtonGroup(self)
+        self.mode_buttons = {}
+        for mid, name in enumerate(("FT8", "FT4", "Off")):
+            btn = QtWidgets.QRadioButton(name)
+            btn.setEnabled(decode_ok or name == "Off")
+            self.mode_group.addButton(btn, mid)
+            self.mode_buttons[name] = btn
+        start = "FT8" if (decode_start and decode_ok) else "Off"
+        self.mode_buttons[start].setChecked(True)
+        if start != "Off":
+            self.mode = start
+            self.decode_t0 = time.time()
+        self.band_box = QtWidgets.QComboBox()
+        self.band_box.addItem("Band...", None)
+        for name, ft8_mhz, ft4_mhz in BANDS:
+            self.band_box.addItem(name, (ft8_mhz, ft4_mhz))
+        self.band_box.currentIndexChanged.connect(self.on_band)
         self.step_box = QtWidgets.QComboBox()
         for name, hz in STEPS:
             self.step_box.addItem(name, hz)
@@ -508,20 +694,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.span_box = QtWidgets.QComboBox()
         for name, khz in SPAN_PRESETS:
             self.span_box.addItem(name, khz)
-        self.span_box.addItem("Max (sample rate)", None)
+        self.span_box.addItem("Max", None)
         self._select_span(span_hz / 1e3)
 
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(self.btn_down)
         controls.addWidget(self.btn_up)
+        controls.addWidget(QtWidgets.QLabel("Band:"))
+        controls.addWidget(self.band_box)
         controls.addWidget(QtWidgets.QLabel("Step:"))
         controls.addWidget(self.step_box)
         controls.addWidget(QtWidgets.QLabel("Span:"))
         controls.addWidget(self.span_box)
         controls.addWidget(self.btn_save)
-        controls.addWidget(self.chk_decode)
+        for btn in self.mode_buttons.values():
+            controls.addWidget(btn)
         controls.addWidget(self.btn_popout)
         controls.addWidget(self.btn_marks)
+        controls.addWidget(self.btn_calls)
+        self.chk_raw = QtWidgets.QCheckBox("Raw power")
+        self.chk_raw.setChecked(True)
+        controls.addWidget(self.chk_raw)
         controls.addStretch(1)
         self.tune_label = QtWidgets.QLabel()
         controls.addWidget(self.tune_label)
@@ -533,6 +726,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_save.clicked.connect(self.save_png)
         self.btn_popout.clicked.connect(self.pop_out)
         self.btn_marks.toggled.connect(self._set_marks_visible)
+        self.btn_calls.toggled.connect(self._set_calls_visible)
+        self.mode_group.idClicked.connect(self._on_mode_clicked)
+        self.chk_raw.toggled.connect(self._on_raw_toggled)
 
         # --- one status line: radio/FFT info, transient messages, version
         self.status = QtWidgets.QLabel()
@@ -540,7 +736,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.version_label = QtWidgets.QLabel(f"v{VERSION}")
         self.version_label.setStyleSheet("color: #808080;")
         status_row = QtWidgets.QHBoxLayout()
+        self.rate_label = QtWidgets.QLabel()
         status_row.addWidget(self.status)
+        status_row.addWidget(self.rate_label)
         status_row.addWidget(self.msg, 1)
         status_row.addWidget(self.version_label)
 
@@ -582,10 +780,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(30)
 
+        # --- hover popup: sender's callsign while the pointer is inside a decoded signal's box
+        self.pop = QtWidgets.QLabel(None, QtCore.Qt.WindowType.ToolTip)
+        self.pop.setFont(QtGui.QFont("sans-serif", 11))
+        self.pop.setMargin(6)
+        self.pop_mark = None
+        self.pop_html = None
+        self.pop_hide = QtCore.QTimer(self)
+        self.pop_hide.setSingleShot(True)
+        self.pop_hide.setInterval(1000)                 # stays at least 1 s after the pointer leaves
+        self.pop_hide.timeout.connect(self._hide_popup)
+        self.wf_plot.scene().sigMouseMoved.connect(self._on_hover)
+        self.wf_plot.viewport().installEventFilter(self)
+
     # ---- decodes pane: pop out / dock back
     def pop_out(self):
         if not self.popped:
-            self.popout.lay.addWidget(self.decode_pane.view)   # moves the history widget
+            self.popout.lay.addWidget(self.decode_pane)        # moves the whole decodes window
+            self.popout.top.insertWidget(1, self.decode_pane.btn_split)   # left of Dock
+            self.decode_pane.top_bar.hide()
             self.popped = True
             self.decode_dock.hide()
         self.popout.show()
@@ -595,7 +808,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def dock_back(self):
         if not self.popped:
             return
-        self.decode_pane.layout().addWidget(self.decode_pane.view)   # moves the history back
+        self.decode_dock.setWidget(self.decode_pane)                 # moves the decodes window back
+        self.decode_pane.top_bar.layout().addWidget(self.decode_pane.btn_split)
+        self.decode_pane.top_bar.show()
         self.popped = False
         self.popout.hide()
         self.decode_dock.show()
@@ -627,10 +842,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.f1 = float(self.an.freq_khz[-1])
 
     def _refresh(self):
+        self.off_axis.tune_hz = float(self.tune_hz)     # audio offset is measured from the dial
+        self.off_axis.picture = None
         self.spec.setXRange(self.f0, self.f1, padding=0)
         self.wf_plot.setXRange(self.f0, self.f1, padding=0)
-        self.tune_label.setText(
-            f"Tune {self.tune_hz / 1e6:.6f} MHz   Span {self.span_hz / 1e3:g} kHz")
+        self.tune_label.setText(f"Tune {self.tune_hz / 1e6:.6f} MHz")
         self.setWindowTitle(f"Airspy HF+  {self.tune_hz / 1e6:.6f} MHz")
         clipped = self.span_hz > FT8_AUDIO_MAX_SPAN
         self.status.setText(
@@ -641,6 +857,106 @@ class MainWindow(QtWidgets.QMainWindow):
             + (" (3.8 kHz max)" if clipped else ""))
         if self.rows:
             self._realloc(self.rows)
+        self._sync_band()
+
+    # ---- display mode: power above background (SNR) or absolute power
+    def _on_raw_toggled(self, on):
+        self.an.raw = on
+        self.spec.setLabel("left", "Power" if on else "SNR", units="dB")
+        self.spec.setYRange(-10 if on else -5, 40, padding=0)   # fixed scale in both modes
+        self.levels = None if on else self.fixed_levels    # colour range is re-set for the new units
+        if self.rows:
+            self._realloc(self.rows)                        # history is in the other units: clear it
+
+    # ---- decode mode: FT8, FT4 or off (one at a time)
+    def _on_mode_clicked(self, mid):
+        mode = {0: "FT8", 1: "FT4", 2: None}[mid]
+        if mode == self.mode:
+            return
+        self._set_mode(mode)
+        if mode is not None and not self.manual_tuned:
+            self._shift_to(mode)
+
+    def _set_mode(self, mode):
+        self.mode = mode
+        self.cfg_version += 1           # a slot in progress under the old mode is skipped
+        self.cur_slot = None            # slot boundaries follow the new cycle length
+        self.decode_times.clear()
+        self.decode_t0 = time.time() if mode is not None else None
+        title = f"{mode} decodes" if mode else "Decodes"
+        self.decode_dock.setWindowTitle(title)
+        self.popout.setWindowTitle(title)
+        self._update_rate()
+
+    def _shift_to(self, mode):
+        """Move the tuning and display window to the normal calling frequency for this mode."""
+        m = MODES[mode]
+        self._tune_window(m["dial_mhz"], m["lo"], m["hi"])
+
+    def _tune_window(self, dial_mhz, lo_khz, hi_khz):
+        """Retune to dial_mhz and show lo_khz-hi_khz (absolute kHz). Returns False if the radio refuses."""
+        tune = round(dial_mhz * 1e6)
+        if not self.radio.set_freq(tune):
+            self.msg.setText("airspyhf_set_freq() failed")
+            return False
+        self.tune_hz = tune
+        self.disp_off = round((lo_khz + hi_khz) / 2 * 1e3) - tune
+        self.span_hz = (hi_khz - lo_khz) * 1e3
+        self.cfg_version += 1
+        self._select_span(self.span_hz / 1e3)
+        self._configure(settle=True)
+        self._refresh()
+        self.msg.setText("")
+        return True
+
+    # ---- band menu
+    def on_band(self, _idx):
+        dials = self.band_box.currentData()
+        if dials is None:
+            return
+        # FT4 selected: use the FT4 segment of the band; FT8 or off: the FT8 segment
+        dial = dials[1] if self.mode == "FT4" else dials[0]
+        if dial is None:
+            self.msg.setText("No standard FT4 frequency on this band")
+            return
+        self.manual_tuned = True
+        self._tune_window(dial, dial * 1e3, dial * 1e3 + BAND_SPAN_KHZ)
+
+    def _sync_band(self):
+        """Show the band-menu entry whose FT8 or FT4 dial matches the current frequency, or 'Band...'."""
+        f = self.tune_hz / 1e6
+        idx = 0
+        for i in range(1, self.band_box.count()):
+            for d in self.band_box.itemData(i):
+                if d is not None and abs(d - f) < 1e-6:
+                    idx = i
+                    break
+            if idx:
+                break
+        self.band_box.blockSignals(True)
+        self.band_box.setCurrentIndex(idx)
+        self.band_box.blockSignals(False)
+
+    # ---- decode rate
+
+    def _update_rate(self):
+        """Refresh the decodes-per-hour readout over the last 15 minutes, or since decoding started."""
+        name = self.mode or "Decode"
+        if self.decode_t0 is None:
+            self.rate_label.setText(f"   {name}: off")
+            return
+        now = time.time()
+        start = max(now - RATE_WINDOW_S, self.decode_t0)
+        while self.decode_times and self.decode_times[0] < start:
+            self.decode_times.popleft()
+        span = now - start
+        if span < RATE_MIN_SPAN_S:
+            self.rate_label.setText(f"   {name} rate: --")
+            return
+        n = len(self.decode_times)
+        basis = (f"last {RATE_WINDOW_S // 60} min" if span >= RATE_WINDOW_S
+                 else f"{span / 60:.1f} min so far")
+        self.rate_label.setText(f"   {name} rate: {n * 3600 / span:.0f}/h ({basis})")
 
     # ---- control callbacks
     def retune(self, delta_hz):
@@ -652,6 +968,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.msg.setText("airspyhf_set_freq() failed")
             return
         self.tune_hz = new
+        self.manual_tuned = True
         self.cfg_version += 1
         self._configure(settle=True)
         self._refresh()
@@ -661,6 +978,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.step_hz = self.step_box.currentData()
 
     def on_span(self, _idx):
+        self.manual_tuned = True
         data = self.span_box.currentData()
         khz = self.rate / 1e3 if data is None else float(data)
         khz = min(khz, self.rate / 1e3)
@@ -683,6 +1001,105 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ov.fill(0)
         self.dirty = True
 
+    def _set_calls_visible(self, on):
+        self.show_call = on
+        self.dirty = True
+
+    # ---- hover popup
+    def eventFilter(self, obj, ev):
+        if obj is self.wf_plot.viewport():
+            if ev.type() == QtCore.QEvent.Type.Leave and self.pop.isVisible():
+                self.pop_hide.start()
+            elif (ev.type() == QtCore.QEvent.Type.MouseButtonPress
+                  and ev.button() == QtCore.Qt.MouseButton.LeftButton
+                  and self.pop.isVisible() and self.pop_mark is not None):
+                sp = self.wf_plot.mapToScene(ev.position().toPoint())
+                p = self.wf_plot.getViewBox().mapSceneToView(sp)
+                if self._mark_at(p.x(), p.y()) is self.pop_mark:
+                    QtGui.QDesktopServices.openUrl(
+                        QtCore.QUrl(f"https://www.qrz.com/db/{self.pop_mark['call']}"))
+        return super().eventFilter(obj, ev)
+
+    def _mark_at(self, x_khz, y_s):
+        """Most recent decoded box with a callsign under the given plot coordinates, or None."""
+        if self.newest_s is None or not self.rows:
+            return None
+        j = y_s / self.row_s + self.rows                # fractional buffer row, as in _row_index
+        for m in reversed(self.marks):
+            if not m.get("call") or not m["x0"] <= x_khz <= m["x0"] + m["w"]:
+                continue
+            if self._row_index(m["s0"]) <= j < self._row_index(m["s1"]) + 1:
+                return m
+        return None
+
+    def _on_hover(self, scene_pos):
+        vb = self.wf_plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            return
+        p = vb.mapSceneToView(scene_pos)
+        m = self._mark_at(p.x(), p.y())
+        if m is None:
+            if self.pop.isVisible() and not self.pop_hide.isActive():
+                self.pop_hide.start()
+            return
+        self.pop_hide.stop()
+        if m is not self.pop_mark:
+            self.pop_mark = m
+            self.pop_html = None
+            colour = "#b7410e" if m["cq"] else "#ffffff"
+            self.pop.setStyleSheet(f"background-color: rgba(0, 0, 0, 220); "
+                                   f"border: 1px solid {colour}; color: {colour};")
+        html = self._popup_html(m)
+        if html != self.pop_html:                       # refreshed in case a grid arrived since
+            self.pop_html = html
+            self.pop.setText(html)
+            self.pop.adjustSize()
+        self.pop.move(QtGui.QCursor.pos() + QtCore.QPoint(18, 18))
+        self.pop.show()
+
+    def _popup_html(self, m):
+        grid = self.grids.get(m["call"])
+        lines = [f"<div style='font-size:18pt; font-weight:bold'>{m['call']}</div>"]
+        if grid:
+            miles = grid_distance_miles(MY_GRID, grid)
+            lines.append(f"<div>Grid {grid}, {miles:.0f} mi</div>")
+        lines.append(f"<div>SNR {m['snr']:+d} dB</div>")
+        lines.append(f"<div>Offset {m['offset']} Hz</div>")
+        return "".join(lines)
+
+    def _hide_popup(self):
+        self.pop.hide()
+        self.pop_mark = None
+        self.pop_html = None
+
+    def _drop_label(self, m):
+        item = m.pop("label", None)
+        if item is not None:
+            self.wf_plot.removeItem(item)
+
+    def _sync_call_labels(self):
+        """Place each sender's callsign in the middle of its signal box; hidden with Mark or Call off."""
+        show = self.show_marks and self.show_call
+        for m in self.marks:
+            if not show or not m.get("call") or self.newest_s is None:
+                self._drop_label(m)
+                continue
+            r0 = self._row_index(m["s0"])
+            r1 = self._row_index(m["s1"])
+            lo, hi = max(r0, 0), min(r1, self.rows - 1)     # visible part of the box
+            if lo > hi:
+                self._drop_label(m)
+                continue
+            item = m.get("label")
+            if item is None:
+                item = pg.TextItem(m["call"], color=MARK_RGBA_CQ[:3] if m["cq"] else (200, 200, 200),
+                                   anchor=(0.5, 0.5), fill=pg.mkBrush(0, 0, 0, 170))
+                item.setFont(QtGui.QFont("sans-serif", 8))
+                self.wf_plot.addItem(item)
+                m["label"] = item
+            item.setPos(m["x0"] + m["w"] / 2,
+                        (-self.rows + (lo + hi) / 2 + 0.5) * self.row_s)
+
     # ---- FT8 slot handling
     def _index_at(self, now, boundary):
         return self.ring.total - int((now - boundary) * self.rate)
@@ -695,20 +1112,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.decoding:
             self.msg.setText(f"Slot {stamp} UTC skipped: previous decode still running")
             return
-        z = self.ring.read(start_idx, FT8_SLOT_S * self.rate)
+        z = self.ring.read(start_idx, int(round(MODES[self.mode]["slot_s"] * self.rate)))
         if z is None:
             self.msg.setText(f"Slot {stamp} UTC skipped: samples overwritten")
             return
         self.decoding = True
-        cfg = (self.tune_hz, self.disp_off, self.span_hz)
+        cfg = (self.tune_hz, self.disp_off, self.span_hz, self.mode)
         threading.Thread(target=self._decode_thread, args=(z, slot_time, cfg, start_idx),
                          daemon=True).start()
 
     def _decode_thread(self, z, slot_time, cfg, start_idx):
-        tune_hz, disp_off, span_hz = cfg
+        tune_hz, disp_off, span_hz, mode = cfg
         try:
             recs = run_decode(z, self.rate, slot_time, tune_hz, disp_off, span_hz,
-                              self.jt9_path, self.shm_dir)
+                              self.jt9_path, self.shm_dir, mode)
             for rec in recs:
                 rec["s0"] = start_idx              # sample index of the slot start
             stamp = time.strftime("%H:%M:%S", time.gmtime(slot_time))
@@ -723,6 +1140,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_decode(self, rec):
         is_cq = rec["msg"].startswith("CQ ")
         self.decode_pane.append(rec["line"], is_cq)
+        if rec["call"] and rec["grid"]:
+            self.grids[rec["call"]] = rec["grid"]          # last grid heard from each call, this session
+        if self.decode_t0 is not None and rec["mode"] == self.mode:
+            self.decode_times.append(rec["slot"])
         try:
             with open(self.all_txt, "a") as f:
                 f.write(rec["line"] + "\n")
@@ -730,11 +1151,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.msg.setText(f"ALL.TXT write failed: {e}")
         self.marks.append({
             "s0": rec["s0"],
-            "s1": rec["s0"] + FT8_SLOT_S * self.rate,
+            "s1": rec["s0"] + int(round(MODES[rec["mode"]]["slot_s"] * self.rate)),
             "cq": is_cq,
+            "call": rec["call"],
+            "snr": rec["snr"],
+            "offset": rec["offset"],
             "x0": rec["rf_hz"] / 1e3,
-            "w": FT8_TONE_BW_HZ / 1e3,
+            "w": MODES[rec["mode"]]["tone_bw"] / 1e3,
         })
+        if self.newest_s is not None and self.rows:      # forget boxes scrolled off, even when hidden
+            keep = []
+            for old in self.marks:
+                if self._row_index(old["s1"]) >= 0:
+                    keep.append(old)
+                else:
+                    self._drop_label(old)
+            self.marks = keep
         self.dirty = True
 
     def _on_decode_status(self, text):
@@ -742,6 +1174,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_decode_done(self):
         self.decoding = False
+        self._update_rate()     # once per FT8 slot, after that slot's decodes have been counted
 
     # ---- waterfall
     def _realloc(self, h):
@@ -776,6 +1209,7 @@ class MainWindow(QtWidgets.QMainWindow):
             r0 = self._row_index(m["s0"])
             r1 = self._row_index(m["s1"])
             if r1 < 0:                              # scrolled off the top: forget it
+                self._drop_label(m)
                 continue
             keep.append(m)
             c0 = int(np.searchsorted(freq, m["x0"], side="left"))
@@ -789,19 +1223,24 @@ class MainWindow(QtWidgets.QMainWindow):
             arm_c = max(2, int(0.4 * (c1 - c0)))   # horizontal arm, columns
             arm_r = max(2, int(0.2 * (r1 - r0 + 1)))   # vertical arm, rows
 
-            # vertical arms along the left and right edges, clipped to the buffer
-            for col in (c0, c1 - 1):
-                ta, tb = max(r0, 0), min(r0 + arm_r, h)
-                ba, bb = max(r1 - arm_r + 1, 0), min(r1 + 1, h)
-                if ta < tb:
-                    self.ov[ta:tb, col] = flag
-                if ba < bb:
-                    self.ov[ba:bb, col] = flag
-            # horizontal arms at the top and bottom corners
-            for row in (r0, r1):
-                if 0 <= row < h:
-                    self.ov[row, c0:c0 + arm_c] = flag
-                    self.ov[row, c1 - arm_c:c1] = flag
+            # CQ outlines are 2 px: each stroke also paints the pixel just inside it
+            t = 1 if m["cq"] else 0
+            for k in range(t + 1):
+                # vertical arms along the left and right edges, clipped to the buffer
+                for col in (c0 + k, c1 - 1 - k):
+                    if not 0 <= col < ncols:
+                        continue
+                    ta, tb = max(r0, 0), min(r0 + arm_r, h)
+                    ba, bb = max(r1 - arm_r + 1, 0), min(r1 + 1, h)
+                    if ta < tb:
+                        self.ov[ta:tb, col] = flag
+                    if ba < bb:
+                        self.ov[ba:bb, col] = flag
+                # horizontal arms at the top and bottom corners
+                for row in (r0 + k, r1 - k):
+                    if 0 <= row < h:
+                        self.ov[row, c0:c0 + arm_c] = flag
+                        self.ov[row, c1 - arm_c:c1] = flag
         self.marks = keep
 
     def _compose(self):
@@ -824,14 +1263,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if h > 10 and h != self.rows:
             self._realloc(h)
 
-        # FT8 slot boundaries (UTC multiples of 15 s)
+        # decode slot boundaries: UTC multiples of the mode's cycle (15 s FT8, 7.5 s FT4)
         now = time.time()
-        slot_b = int(now // FT8_SLOT_S) * FT8_SLOT_S
+        slot_s = MODES[self.mode]["slot_s"] if self.mode is not None else 15.0
+        slot_b = int(now // slot_s) * slot_s
         if self.cur_slot is None:
             self.cur_slot = (slot_b, self._index_at(now, slot_b), self.cfg_version)
         elif slot_b != self.cur_slot[0]:
             prev_b, prev_idx, prev_ver = self.cur_slot
-            if self.chk_decode.isChecked():
+            if self.mode is not None:
                 self._start_decode(prev_b, prev_idx, prev_ver)
             self.cur_slot = (slot_b, self._index_at(now, slot_b), self.cfg_version)
 
@@ -853,6 +1293,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.levels = (float(lo), hi)                # frozen after this
 
             self.spec_curve.setData(self.an.freq_khz, spec_db)
+            self.spec_avg_curve.setData(self.an.freq_khz, self.an.spec_avg_db)
             self.dirty = True
 
         # One image update per change: waterfall pixels and marks together
@@ -860,6 +1301,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.show_marks and self.newest_s is not None and self.marks:
                 self._paint_marks()
             self._compose()
+            self._sync_call_labels()
             self.dirty = False
 
 # ------------------------------------------------------------ main
