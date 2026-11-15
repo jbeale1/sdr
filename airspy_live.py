@@ -35,7 +35,7 @@ import scipy.fft as sfft
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.12.0"
+VERSION = "0.12.1"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -506,10 +506,12 @@ class DecodeWindow(QtWidgets.QWidget):
         self.btn_split = QtWidgets.QPushButton("Two panes")
         self.btn_split.setCheckable(True)
         self.btn_split.toggled.connect(self._set_split)
-        self.top_bar = QtWidgets.QWidget()           # hidden while popped out; the button moves to that window
+        self.btn_stats = QtWidgets.QPushButton("Stats")  # opens the per-callsign stats window (MainWindow)
+        self.top_bar = QtWidgets.QWidget()           # hidden while popped out; the buttons move to that window
         top = QtWidgets.QHBoxLayout(self.top_bar)
         top.setContentsMargins(0, 0, 0, 0)
         top.addStretch(1)
+        top.addWidget(self.btn_stats)
         top.addWidget(self.btn_split)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
@@ -553,6 +555,98 @@ class DecodeWindow(QtWidgets.QWidget):
         cur.insertText(line, fmt)
         if at_bottom:
             sb.setValue(sb.maximum())
+
+
+class _SortItem(QtWidgets.QTableWidgetItem):
+    """Table cell whose sort order comes from a separate key (number or text), not its display text."""
+
+    def __init__(self, text, key):
+        super().__init__(text)
+        self.key = key
+
+    def __lt__(self, other):
+        return self.key < other.key
+
+
+class StatsWindow(QtWidgets.QWidget):
+    """Per-callsign FT8 packet statistics. Sortable by any column; refreshed while visible."""
+
+    COLUMNS = ["Call", "First (UTC)", "Last (UTC)", "Total", "CQ",
+               "Min dB", "Max dB", "Avg dB", "Grid", "Distance (mi)"]
+
+    def __init__(self, source):
+        super().__init__(None, QtCore.Qt.Window)
+        self.source = source            # callable returning (stats dict, mode)
+        self.setWindowTitle("FT8 stats")
+        self.resize(860, 480)
+        self.table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(3, QtCore.Qt.SortOrder.DescendingOrder)     # busiest senders first
+        self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._context_menu)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.addWidget(self.table)
+        self.dirty = False
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._refresh_if_due)
+        self.timer.start(1000)          # new decodes are batched into at most one rebuild per second
+
+    def changeEvent(self, ev):
+        # Losing focus (clicking into another window) drops the orange row highlight.
+        if ev.type() == QtCore.QEvent.Type.WindowDeactivate:
+            self.table.clearSelection()
+        super().changeEvent(ev)
+
+    def _context_menu(self, pos):
+        item = self.table.itemAt(pos)
+        if item is None or item.column() != 0:          # Call column only
+            return
+        call = item.text()
+        menu = QtWidgets.QMenu(self)
+        menu.addAction("Look up on QRZ.com",
+                       lambda: QtGui.QDesktopServices.openUrl(
+                           QtCore.QUrl(f"https://www.qrz.com/db/{call}")))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def mark_dirty(self):
+        self.dirty = True
+
+    def _refresh_if_due(self):
+        if self.dirty and self.isVisible():
+            self.rebuild()
+
+    def rebuild(self):
+        stats, mode = self.source()
+        self.dirty = False
+        self.setWindowTitle(f"{mode} stats" if mode else "FT8 stats")
+        self.table.setSortingEnabled(False)     # rows must not move while they are being filled
+        self.table.setRowCount(len(stats))
+        for row, (call, s) in enumerate(stats.items()):
+            total = s["total"]
+            avg = s["snr_sum"] / total
+            grid = s["grid"] or ""
+            miles = grid_distance_miles(MY_GRID, grid) if grid else None
+            cells = [
+                _SortItem(call, call),
+                _SortItem(time.strftime("%H:%M:%S", time.gmtime(s["first"])), s["first"]),
+                _SortItem(time.strftime("%H:%M:%S", time.gmtime(s["last"])), s["last"]),
+                _SortItem(str(total), total),
+                _SortItem(str(s["cq"]), s["cq"]),
+                _SortItem(f"{s['snr_min']:+d}", s["snr_min"]),
+                _SortItem(f"{s['snr_max']:+d}", s["snr_max"]),
+                _SortItem(f"{avg:+.1f}", avg),
+                _SortItem(grid, grid),
+                _SortItem(f"{miles:.0f}" if miles is not None else "",
+                          miles if miles is not None else -1.0),
+            ]
+            for col, item in enumerate(cells):
+                self.table.setItem(row, col, item)
+        self.table.setSortingEnabled(True)
 
 
 class DecodePopout(QtWidgets.QWidget):
@@ -617,6 +711,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.marks = []                 # [{"s0", "s1", "cq", "x0", "w"}]
         self.show_marks = True
         self.grids = {}                 # session: callsign -> last grid square heard from it
+        self.stats = {}                 # callsign -> running packet totals, for the Stats window
+        self.stats_mode = None          # mode the stats were gathered in: "FT8", "FT4" or None
         self.ov = None                  # overlay codes, same shape as wf: 0 none, 1 other, 2 CQ
         self.newest_s = None            # sample index of the newest waterfall row's start
         self.dirty = False              # set when the image needs rebuilding
@@ -682,6 +778,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if start != "Off":
             self.mode = start
             self.decode_t0 = time.time()
+        self.stats_mode = self.mode
         self.band_box = QtWidgets.QComboBox()
         self.band_box.addItem("Band...", None)
         for name, ft8_mhz, ft4_mhz in BANDS:
@@ -773,6 +870,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.popout.closed.connect(self.dock_back)
         self.popped = False             # True while the history lives in the popout window
 
+        self.stats_win = StatsWindow(lambda: (self.stats, self.stats_mode))
+        self.decode_pane.btn_stats.clicked.connect(self.show_stats)
+
         self._configure(settle=False)
         self._refresh()
 
@@ -781,7 +881,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.start(30)
 
         # --- hover popup: sender's callsign while the pointer is inside a decoded signal's box
-        self.pop = QtWidgets.QLabel(None, QtCore.Qt.WindowType.ToolTip)
+        # Parented to the main window so the window manager treats it as this window's tooltip,
+        # not one belonging to whichever window (such as the Stats window) last had focus.
+        self.pop = QtWidgets.QLabel(self, QtCore.Qt.WindowType.ToolTip)
         self.pop.setFont(QtGui.QFont("sans-serif", 11))
         self.pop.setMargin(6)
         self.pop_mark = None
@@ -797,7 +899,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def pop_out(self):
         if not self.popped:
             self.popout.lay.addWidget(self.decode_pane)        # moves the whole decodes window
-            self.popout.top.insertWidget(1, self.decode_pane.btn_split)   # left of Dock
+            self.popout.top.insertWidget(1, self.decode_pane.btn_stats)   # left of Single pane / Two panes
+            self.popout.top.insertWidget(2, self.decode_pane.btn_split)   # left of Dock
             self.decode_pane.top_bar.hide()
             self.popped = True
             self.decode_dock.hide()
@@ -809,6 +912,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.popped:
             return
         self.decode_dock.setWidget(self.decode_pane)                 # moves the decodes window back
+        self.decode_pane.top_bar.layout().addWidget(self.decode_pane.btn_stats)
         self.decode_pane.top_bar.layout().addWidget(self.decode_pane.btn_split)
         self.decode_pane.top_bar.show()
         self.popped = False
@@ -879,6 +983,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_mode(self, mode):
         self.mode = mode
+        if mode is not None and mode != self.stats_mode:    # Stats cover one mode at a time
+            self.stats = {}
+            self.stats_mode = mode
+            self.stats_win.mark_dirty()
         self.cfg_version += 1           # a slot in progress under the old mode is skipped
         self.cur_slot = None            # slot boundaries follow the new cycle length
         self.decode_times.clear()
@@ -1142,6 +1250,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.decode_pane.append(rec["line"], is_cq)
         if rec["call"] and rec["grid"]:
             self.grids[rec["call"]] = rec["grid"]          # last grid heard from each call, this session
+        self._update_stats(rec, is_cq)
         if self.decode_t0 is not None and rec["mode"] == self.mode:
             self.decode_times.append(rec["slot"])
         try:
@@ -1168,6 +1277,33 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._drop_label(old)
             self.marks = keep
         self.dirty = True
+
+    def _update_stats(self, rec, is_cq):
+        """Add one decode to the per-callsign totals shown in the Stats window."""
+        call = rec["call"]
+        if not call or rec["mode"] != self.stats_mode:   # unidentified sender, or a leftover from the old mode
+            return
+        snr, slot = rec["snr"], rec["slot"]
+        s = self.stats.get(call)
+        if s is None:
+            s = self.stats[call] = {"first": slot, "last": slot, "total": 0, "cq": 0,
+                                    "snr_min": snr, "snr_max": snr, "snr_sum": 0, "grid": None}
+        s["first"] = min(s["first"], slot)
+        s["last"] = max(s["last"], slot)
+        s["total"] += 1
+        s["cq"] += int(is_cq)
+        s["snr_min"] = min(s["snr_min"], snr)
+        s["snr_max"] = max(s["snr_max"], snr)
+        s["snr_sum"] += snr
+        if rec["grid"]:
+            s["grid"] = rec["grid"]
+        self.stats_win.mark_dirty()
+
+    def show_stats(self):
+        self.stats_win.rebuild()
+        self.stats_win.show()
+        self.stats_win.raise_()
+        self.stats_win.activateWindow()
 
     def _on_decode_status(self, text):
         self.msg.setText(text)
@@ -1437,3 +1573,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
