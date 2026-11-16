@@ -8,7 +8,10 @@ Decodes are appended to ALL.TXT in the current directory and shown in a pane at 
 bottom of the window, or in a separate window after "Pop out". CQ decodes are
 highlighted there and can be marked on the waterfall.
 
--J.Beale N8JUF  14-Nov-2025
+For this to work on Windows, copy all the .dll files in https://airspy.com/downloads/sdrsharp-x64.zip
+into the same folder as this python code.
+
+-J.Beale N8JUF  15-Nov-2025
 
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
@@ -23,6 +26,7 @@ import math
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -35,7 +39,7 @@ import scipy.fft as sfft
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.12.1"
+VERSION = "0.14.3"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -114,7 +118,13 @@ SAMPLE_CB_T = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(Transfer))
 
 
 def load_lib():
-    name = ctypes.util.find_library("airspyhf") or "libairspyhf.so.0"
+    if sys.platform == "win32":
+        # Python 3.8+ does not search the script folder for a DLL's own dependencies, so add it
+        here = os.path.dirname(os.path.abspath(__file__))
+        os.add_dll_directory(here)
+        name = os.path.join(here, "airspyhf.dll")
+    else:
+        name = ctypes.util.find_library("airspyhf") or "libairspyhf.so.0"
     lib = ctypes.CDLL(name)
     dev_t = ctypes.c_void_p
     sigs = {
@@ -397,6 +407,19 @@ def sending_grid(msg):
     return toks[-1]
 
 
+REPORT_RE = re.compile(r"^R?[+-]\d{1,2}$")
+
+
+def report_to(msg):
+    """Callsign a 'TO FROM REPORT' message is addressed to, if it carries a signal report, else None."""
+    toks = msg.split()
+    if len(toks) != 3 or toks[0] == "CQ" or REPORT_RE.match(toks[2]) is None:
+        return None
+    if not (is_callsign(toks[0]) and is_callsign(toks[1])):
+        return None
+    return toks[0]
+
+
 EARTH_RADIUS_MI = 3958.8
 
 
@@ -571,8 +594,10 @@ class _SortItem(QtWidgets.QTableWidgetItem):
 class StatsWindow(QtWidgets.QWidget):
     """Per-callsign FT8 packet statistics. Sortable by any column; refreshed while visible."""
 
-    COLUMNS = ["Call", "First (UTC)", "Last (UTC)", "Total", "CQ",
+    COLUMNS = ["Call", "First (UTC)", "Last (UTC)", "Total", "CQ", "2way",
                "Min dB", "Max dB", "Avg dB", "Grid", "Distance (mi)"]
+    SUMMARY = ["Decodes", "Calls", "CQs", "2-way"]
+    TITLE_FG = QtGui.QColor(190, 190, 190)     # header titles: bold, but not full white
 
     def __init__(self, source):
         super().__init__(None, QtCore.Qt.Window)
@@ -581,16 +606,40 @@ class StatsWindow(QtWidgets.QWidget):
         self.resize(860, 480)
         self.table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        bold = self.table.horizontalHeader().font()
+        bold.setBold(True)                          # bold titles set the column widths
+        for i in range(len(self.COLUMNS)):
+            self.table.horizontalHeaderItem(i).setFont(bold)
+            self.table.horizontalHeaderItem(i).setForeground(QtGui.QBrush(self.TITLE_FG))
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setSortingEnabled(True)
         self.table.sortItems(3, QtCore.Qt.SortOrder.DescendingOrder)     # busiest senders first
+        header = self.table.horizontalHeader()
+        header.sortIndicatorChanged.connect(self._mark_sort_column)
+        self._mark_sort_column(3, QtCore.Qt.SortOrder.DescendingOrder)
         self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
+        self.summary_vals = {}
+        summary = QtWidgets.QHBoxLayout()
+        for name in self.SUMMARY:
+            val = QtWidgets.QLabel("0")
+            summary.addWidget(QtWidgets.QLabel(name + ":"))
+            summary.addWidget(val)
+            summary.addSpacing(14)
+            self.summary_vals[name] = val
+        summary.addStretch(1)
+        summary_box = QtWidgets.QWidget()
+        summary_box.setLayout(summary)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        splitter.addWidget(summary_box)
+        splitter.addWidget(self.table)
+        splitter.setStretchFactor(1, 1)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
-        lay.addWidget(self.table)
+        lay.addWidget(splitter)
         self.dirty = False
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._refresh_if_due)
@@ -620,23 +669,40 @@ class StatsWindow(QtWidgets.QWidget):
         if self.dirty and self.isVisible():
             self.rebuild()
 
+    def _mark_sort_column(self, col, order):
+        """Highlight the sorted column's title instead of drawing a sort arrow, which would not fit."""
+        pal = self.table.palette()
+        for i in range(self.table.columnCount()):
+            item = self.table.horizontalHeaderItem(i)
+            if i == col:
+                item.setBackground(pal.highlight())
+                item.setForeground(pal.highlightedText())
+            else:
+                item.setData(QtCore.Qt.ItemDataRole.BackgroundRole, None)
+                item.setForeground(QtGui.QBrush(self.TITLE_FG))
+
     def rebuild(self):
         stats, mode = self.source()
         self.dirty = False
         self.setWindowTitle(f"{mode} stats" if mode else "FT8 stats")
         self.table.setSortingEnabled(False)     # rows must not move while they are being filled
         self.table.setRowCount(len(stats))
+        two_total = 0                   # summed over rows: each 2-way contact is counted twice
         for row, (call, s) in enumerate(stats.items()):
             total = s["total"]
             avg = s["snr_sum"] / total
             grid = s["grid"] or ""
             miles = grid_distance_miles(MY_GRID, grid) if grid else None
+            # 2way: partners this call sent a report to that also sent one back to it
+            two_way = sum(1 for p in s["rpt_to"] if call in stats.get(p, {}).get("rpt_to", ()))
+            two_total += two_way
             cells = [
                 _SortItem(call, call),
                 _SortItem(time.strftime("%H:%M:%S", time.gmtime(s["first"])), s["first"]),
                 _SortItem(time.strftime("%H:%M:%S", time.gmtime(s["last"])), s["last"]),
                 _SortItem(str(total), total),
                 _SortItem(str(s["cq"]), s["cq"]),
+                _SortItem(str(two_way), two_way),
                 _SortItem(f"{s['snr_min']:+d}", s["snr_min"]),
                 _SortItem(f"{s['snr_max']:+d}", s["snr_max"]),
                 _SortItem(f"{avg:+.1f}", avg),
@@ -646,7 +712,17 @@ class StatsWindow(QtWidgets.QWidget):
             ]
             for col, item in enumerate(cells):
                 self.table.setItem(row, col, item)
+        totals = {
+            "Decodes": sum(s["total"] for s in stats.values()),
+            "Calls": len(stats),
+            "CQs": sum(s["cq"] for s in stats.values()),
+            "2-way": two_total // 2,
+        }
+        for name, value in totals.items():
+            self.summary_vals[name].setText(f"{value:,}")
+        self.table.resizeColumnsToContents()
         self.table.setSortingEnabled(True)
+        self.table.horizontalHeader().setSortIndicatorShown(False)   # re-enabling sorting turns it on
 
 
 class DecodePopout(QtWidgets.QWidget):
@@ -1008,6 +1084,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.msg.setText("airspyhf_set_freq() failed")
             return False
         self.tune_hz = tune
+        self.levels = self.fixed_levels     # new band: re-learn the colour range from its first rows
         self.disp_off = round((lo_khz + hi_khz) / 2 * 1e3) - tune
         self.span_hz = (hi_khz - lo_khz) * 1e3
         self.cfg_version += 1
@@ -1186,8 +1263,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.wf_plot.removeItem(item)
 
     def _sync_call_labels(self):
-        """Place each sender's callsign in the middle of its signal box; hidden with Mark or Call off."""
+        """Place each sender's callsign in the middle of its signal box; hidden with Mark or Call off.
+        Where two labels would overlap, one moves up and the other down by half a label height."""
         show = self.show_marks and self.show_call
+        fm = QtGui.QFontMetrics(QtGui.QFont("sans-serif", 8))
+        lab_h = fm.height()                                 # rows: the waterfall has one row per pixel
+        px_per_khz = self.wf_plot.getViewBox().width() / max(self.f1 - self.f0, 1e-9)
+        entries = []
         for m in self.marks:
             if not show or not m.get("call") or self.newest_s is None:
                 self._drop_label(m)
@@ -1205,8 +1287,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setFont(QtGui.QFont("sans-serif", 8))
                 self.wf_plot.addItem(item)
                 m["label"] = item
-            item.setPos(m["x0"] + m["w"] / 2,
-                        (-self.rows + (lo + hi) / 2 + 0.5) * self.row_s)
+            cx_khz = m["x0"] + m["w"] / 2
+            entries.append({"item": item, "cx_khz": cx_khz,
+                            "x_px": (cx_khz - self.f0) * px_per_khz,
+                            "w_px": fm.horizontalAdvance(m["call"]) + 6,
+                            "row": (lo + hi) / 2 + 0.5, "shift": 0.0})
+        for i, b in enumerate(entries):
+            for a in entries[:i]:
+                if a["shift"] or b["shift"]:               # each label moves at most once
+                    continue
+                if (abs(a["x_px"] - b["x_px"]) < (a["w_px"] + b["w_px"]) / 2
+                        and abs(a["row"] - b["row"]) < lab_h):
+                    half = lab_h / 2
+                    up, down = (a, b) if a["row"] >= b["row"] else (b, a)
+                    up["shift"], down["shift"] = half, -half
+        for e in entries:
+            e["item"].setPos(e["cx_khz"], (e["row"] + e["shift"] - self.rows) * self.row_s)
 
     # ---- FT8 slot handling
     def _index_at(self, now, boundary):
@@ -1287,7 +1383,8 @@ class MainWindow(QtWidgets.QMainWindow):
         s = self.stats.get(call)
         if s is None:
             s = self.stats[call] = {"first": slot, "last": slot, "total": 0, "cq": 0,
-                                    "snr_min": snr, "snr_max": snr, "snr_sum": 0, "grid": None}
+                                    "snr_min": snr, "snr_max": snr, "snr_sum": 0, "grid": None,
+                                    "rpt_to": set()}
         s["first"] = min(s["first"], slot)
         s["last"] = max(s["last"], slot)
         s["total"] += 1
@@ -1297,6 +1394,9 @@ class MainWindow(QtWidgets.QMainWindow):
         s["snr_sum"] += snr
         if rec["grid"]:
             s["grid"] = rec["grid"]
+        addressee = report_to(rec["msg"])
+        if addressee:
+            s["rpt_to"].add(addressee)
         self.stats_win.mark_dirty()
 
     def show_stats(self):
@@ -1471,8 +1571,10 @@ def main():
                     help="compression scale in dB above the colour top "
                          "(0 = linear; larger = less compression)")
     ap.add_argument("--jt9", default="jt9", help="path to the jt9 decoder (default: jt9 on PATH)")
-    ap.add_argument("--shm-dir", default="/dev/shm/airspy_ft8",
-                    help="directory for temporary decoder WAVs (default /dev/shm/airspy_ft8)")
+    shm_default = ("/dev/shm/airspy_ft8" if os.path.isdir("/dev/shm")
+                   else os.path.join(tempfile.gettempdir(), "airspy_ft8"))
+    ap.add_argument("--shm-dir", default=shm_default,
+                    help=f"directory for temporary decoder WAVs (default {shm_default})")
     ap.add_argument("--no-decode", action="store_true", help="start with FT8 decoding off")
     args = ap.parse_args()
 
@@ -1573,4 +1675,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
