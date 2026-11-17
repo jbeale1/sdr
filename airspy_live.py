@@ -8,10 +8,7 @@ Decodes are appended to ALL.TXT in the current directory and shown in a pane at 
 bottom of the window, or in a separate window after "Pop out". CQ decodes are
 highlighted there and can be marked on the waterfall.
 
-For this to work on Windows, copy all the .dll files in https://airspy.com/downloads/sdrsharp-x64.zip
-into the same folder as this python code.
-
--J.Beale N8JUF  15-Nov-2025
+-J.Beale N8JUF  17-Nov-2025
 
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
@@ -39,7 +36,7 @@ import scipy.fft as sfft
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.14.3"
+VERSION = "0.15.5"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -60,10 +57,9 @@ RATE_WINDOW_S = 15 * 60         # decode-rate window: most recent 15 minutes
 RATE_MIN_SPAN_S = 60.0          # below this much elapsed time the rate is shown as "--"
 MY_GRID = "CN85"                # own Maidenhead grid square, for distances in the hover popup
 
-STEPS = [("1 Hz", 1), ("10 Hz", 10), ("50 Hz", 50), ("100 Hz", 100),
-         ("500 Hz", 500), ("1 kHz", 1000), ("2 kHz", 2000),
-         ("5 kHz", 5000), ("10 kHz", 10000)]
-DEFAULT_STEP_INDEX = 5          # 1 kHz
+RAW_Y_MIN_DB = -30.0            # lowest spectrum axis value in Raw power mode, for this receiver
+COUNT_STRIP_W = 34              # width of the decode-count strip beside the waterfall, px
+COUNT_AXIS_H = 50               # height of the top and bottom axes of the waterfall column, px
 
 SPAN_PRESETS = [
     ("500 Hz", 0.5),
@@ -80,7 +76,7 @@ BANDS = [
     ("160 m", 1.840, None), ("80 m", 3.573, 3.575), ("60 m", 5.357, None),
     ("40 m", 7.074, 7.0475), ("30 m", 10.136, 10.140), ("20 m", 14.074, 14.080),
     ("17 m", 18.100, 18.104), ("15 m", 21.074, 21.140), ("12 m", 24.915, 24.919),
-    ("10 m", 28.074, 28.180),
+    ("10 m", 28.074, 28.180), ("2 m", 144.174, 144.170),
 ]
 BAND_SPAN_KHZ = 3.0             # display width when a band is selected, as at startup
 
@@ -93,7 +89,7 @@ MODES = {
     # dial_mhz: normal calling frequency; lo/hi: display window (kHz) selected with the mode
     "FT8": {"slot_s": 15.0, "tone_bw": 50.0, "jt9": ["-8", "-d", "3", "-f", "2100"],
             "dial_mhz": 14.074, "lo": 14074.0, "hi": 14077.0},
-    "FT4": {"slot_s": 7.5, "tone_bw": 90.0, "jt9": ["-4", "-d", "3", "-f", "2100"],
+    "FT4": {"slot_s": 7.5, "tone_bw": 90.0, "jt9": ["-5", "-d", "3", "-f", "2100", "-p", "7.5"],
             "dial_mhz": 14.080, "lo": 14080.0, "hi": 14083.0},
 }
 DECODE_RE = re.compile(r"^\s*(?:\d{6}\s+)?(-?\d+)\s+(-?\d+\.\d+)\s+(\d+(?:\.\d+)?)\s+~\s+(.*\S)\s*$")
@@ -102,6 +98,7 @@ ANN_RE = re.compile(r"^(.*?)((?:\s+\?)?(?:\s+a\d+)?)\s*$")   # message, then opt
 
 MARK_RGBA_CQ = (183, 65, 14, 255)               # rust red: not a viridis colour
 MARK_RGBA_OTHER = (130, 130, 130, 255)
+SLOT_LINE_RGBA = (90, 200, 255, 255)           # slot boundary lines, drawn with Mark on
 
 # ---------------------------------------------------------------- libairspyhf
 
@@ -165,6 +162,12 @@ class Radio:
 
     def __init__(self, lib, dev):
         self.lib, self.dev = lib, dev
+
+    def stop(self):
+        self.lib.airspyhf_stop(self.dev)
+
+    def start(self):
+        return self.lib.airspyhf_start(self.dev, self.cb, None) == 0
 
     def set_freq(self, hz):
         return self.lib.airspyhf_set_freq(self.dev, int(hz)) == 0
@@ -231,6 +234,204 @@ class Receiver:
 
 # ------------------------------------------------------------ DSP
 
+# Tx Test: a transmission is a block of spectrum this far above the background reference
+TX_THRESHOLD_DB = 4.0           # on the TX_STAT_KHZ-average excess, searched in the central 50%
+TX_STAT_KHZ = 2.0               # detection statistic: power averaged over this width
+TX_MIN_S = 1.5                  # continuous time above threshold needed to confirm a transmission
+TX_GAP_S = 0.3                  # a dropout shorter than this does not end a transmission
+TX_SKIP_S = 0.5                 # left out of the peak-hold trace at the start and at the end
+TX_MAX_S = 60.0                 # longer than this is taken as a constant carrier, not a transmission
+TX_CHANNEL_HALF_KHZ = 7.5       # the transmission's channel: within this of its strongest column
+TX_REF_TAU_S = 60.0             # background reference follows slow changes while nothing is detected
+TX_WARMUP_S = 5.0               # initial background reference = average over this long
+TX_SMOOTH_KHZ = 1.0             # bandwidth is measured on the average spectrum, smoothed over this
+TX_BW_DB = 6.0                  # occupied bandwidth: contiguous columns within this of the peak
+TX_DELAY_S = TX_GAP_S + TX_SKIP_S   # rows are held this long, so the last TX_SKIP_S can be dropped
+NOISE_REPORT_S = 600            # noise stats are logged on UTC multiples of this
+
+
+def tx_line(r, raw):
+    """One log line for a finished transmission."""
+    unit = "dB (raw)" if raw else "dB SNR"
+    stamp = time.strftime("%H:%M:%S", time.gmtime(r["wall"]))
+    bw = "--" if r["bw"] is None else f"{r['bw']:.1f} kHz"
+    pk = "--" if r["peak"] is None else f"{r['peak']:+.1f} {unit}"
+    av = "--" if r["avg"] is None else f"{r['avg']:+.1f} {unit}"
+    sn = "--" if r.get("snr") is None else f"{r['snr']:+.1f} dB"
+    return (f"{stamp} UTC  {r['mhz']:.4f} MHz  BW {bw}  peak {pk}  avg {av}  "
+            f"avg SNR {sn}  {r['dur']:.1f} s")
+
+
+def tx_noise_line(rep):
+    """One log line of background noise stats."""
+    stamp = time.strftime("%H:%M", time.gmtime(rep["wall"]))
+    return (f"{stamp} UTC  NOISE  floor {rep['floor']:.1f} dB (raw, central 50%)  "
+            f"2 kHz-avg excess max {rep['max']:+.1f} dB, mean {rep['mean']:+.2f} dB, "
+            f"threshold {TX_THRESHOLD_DB:.1f} dB  over {rep['rows']} rows")
+
+
+class TxDetector:
+    """Tx Test: finds transmissions and their peak, bandwidth, SNR and duration, and tracks the
+    background. Peak hold uses the rows feed() returns."""
+
+    def __init__(self, freq_khz, row_s):
+        self.freq_khz = freq_khz
+        self.row_s = row_s
+        n = len(freq_khz)
+        dk = float(np.median(np.diff(freq_khz)))
+        self.n_stat = max(1, int(round(TX_STAT_KHZ / dk)))
+        idx = np.arange(n)
+        self.center_mask = (idx >= n // 4) & (idx < 3 * n // 4)
+        self.ref_lin = None     # background reference, linear power per column
+        self.ref_s = None       # ref_lin averaged over TX_STAT_KHZ
+        self.warm_sum = None
+        self.warm_n = 0
+        self.new_result = None  # finished transmission waiting to be logged
+        self._reset_noise()
+        self.reset_events()
+
+    def _smooth(self, arr, n):
+        return np.convolve(arr, np.ones(n) / n, mode="same")
+
+    def _reset_noise(self):
+        self.noise_max = -np.inf
+        self.noise_sum = 0.0
+        self.noise_n = 0
+
+    def _noise_sample(self, top, mean):
+        self.noise_max = max(self.noise_max, top)
+        self.noise_sum += mean
+        self.noise_n += 1
+
+    def take_noise_report(self):
+        """Noise stats since the last call, or None if there is nothing to report. Resets them."""
+        if self.ref_lin is None or self.noise_n == 0:
+            self._reset_noise()
+            return None
+        rep = {"wall": time.time(),
+               "floor": float(np.median(10 * np.log10(self.ref_lin[self.center_mask] + 1e-30))),
+               "max": float(self.noise_max),
+               "mean": self.noise_sum / self.noise_n,
+               "rows": self.noise_n}
+        self._reset_noise()
+        return rep
+
+    def reset_events(self):
+        """Forget any candidate or transmission in progress (keeps the background reference)."""
+        self._drop_candidate()
+        self.new_result = None
+
+    def _drop_candidate(self):
+        self.cand = None        # row time at which the current candidate began
+        self.last_above = None  # row time of the latest row above threshold
+        self.center = None      # column of the signal's strongest statistic
+        self.mask = None        # columns within the channel
+        self.active = False     # True once the candidate has lasted TX_MIN_S
+        self.queue = deque()    # (t, display row, linear row, channel peak), held back
+        self.tx_start = None
+        self.tx_peak = None
+        self.tx_sum = 0.0
+        self.tx_n = 0
+        self.tx_abs = None      # per-column sum of linear power over the counted rows
+        self.tx_lin = None      # per-column sum of power relative to the peak's level
+        self.last = None
+
+    def _track_ref(self, lin):
+        w = self.row_s / TX_REF_TAU_S
+        self.ref_lin = self.ref_lin + w * (lin - self.ref_lin)
+        self.ref_s = self._smooth(self.ref_lin, self.n_stat)
+
+    def feed(self, t, lin, disp):
+        """One row at time t (s since configure). lin: averaged linear power per column;
+        disp: displayed values. Returns the display rows to count toward peak hold now."""
+        if self.ref_lin is None:
+            self.warm_sum = lin.copy() if self.warm_sum is None else self.warm_sum + lin
+            self.warm_n += 1
+            if t >= TX_WARMUP_S:
+                self.ref_lin = self.warm_sum / self.warm_n
+                self.ref_s = self._smooth(self.ref_lin, self.n_stat)
+            return [disp]
+        S = 10 * np.log10(self._smooth(lin, self.n_stat) / self.ref_s + 1e-30)
+        if self.cand is None:
+            masked = np.where(self.center_mask, S, -np.inf)
+            idx = int(np.argmax(masked))
+            top = float(masked[idx])
+            if top < TX_THRESHOLD_DB:
+                self._noise_sample(top, float(S[self.center_mask].mean()))
+                self._track_ref(lin)
+                return [disp]
+            self.cand = t
+            self.center = idx
+            self.mask = np.abs(self.freq_khz - self.freq_khz[idx]) <= TX_CHANNEL_HALF_KHZ
+            self.last_above = t
+            self.queue.clear()
+        if float(S[self.mask].max()) >= TX_THRESHOLD_DB:
+            self.last_above = t
+        out = []
+        if t - self.last_above > TX_GAP_S or t - self.cand > TX_MAX_S:
+            if self.active:
+                self._finish()          # the queue holds only the last TX_SKIP_S: dropped
+            else:
+                out.extend(d for _, d, _, _ in self.queue)     # not a transmission after all
+            self._drop_candidate()
+            out.append(disp)
+            return out
+        if t >= self.cand + TX_SKIP_S:
+            self.queue.append((t, disp, lin, float(disp[self.mask].max())))
+        if not self.active and self.last_above - self.cand >= TX_MIN_S:
+            self.active = True
+            self.tx_start = time.time() - (t - self.cand)
+        if self.active:
+            while self.queue and self.queue[0][0] <= t - TX_DELAY_S:
+                _, d, l, pk = self.queue.popleft()
+                out.append(d)
+                self._count(l, d, pk)
+        return out
+
+    def _count(self, lin, disp, pk):
+        self.tx_peak = pk if self.tx_peak is None else max(self.tx_peak, pk)
+        self.tx_sum += pk
+        self.tx_n += 1
+        self.tx_abs = lin.copy() if self.tx_abs is None else self.tx_abs + lin
+        rel = 10 ** (disp / 10.0)
+        self.tx_lin = rel.copy() if self.tx_lin is None else self.tx_lin + rel
+
+    def _bandwidth(self):
+        """Width in kHz of the contiguous columns within TX_BW_DB of the peak, the peak column,
+        and the first and last of those columns."""
+        if self.tx_lin is None:
+            return None, self.center, None, None
+        mean = self.tx_lin / self.tx_n
+        dk = float(np.median(np.diff(self.freq_khz)))
+        n = max(1, int(round(TX_SMOOTH_KHZ / dk)))
+        spec = 10 * np.log10(np.convolve(mean, np.ones(n) / n, mode="same") + 1e-30)
+        p = int(np.argmax(np.where(self.mask, spec, -np.inf)))
+        level = spec[p] - TX_BW_DB
+        lo = p
+        while lo > 0 and spec[lo - 1] >= level:
+            lo -= 1
+        hi = p
+        while hi < len(spec) - 1 and spec[hi + 1] >= level:
+            hi += 1
+        return float(self.freq_khz[hi] - self.freq_khz[lo]), p, lo, hi
+
+    def _finish(self):
+        bw, p, lo, hi = self._bandwidth()
+        snr = None
+        if lo is not None and self.tx_abs is not None:
+            sig = float(np.mean(self.tx_abs[lo:hi + 1] / self.tx_n))
+            bg = float(np.mean(self.ref_lin[lo:hi + 1]))
+            snr = 10 * np.log10(sig / bg + 1e-30)
+        self.last = {"wall": self.tx_start,
+                     "mhz": float(self.freq_khz[p]) / 1e3,
+                     "bw": bw,
+                     "peak": self.tx_peak,
+                     "avg": self.tx_sum / self.tx_n if self.tx_n else None,
+                     "snr": snr,
+                     "dur": self.last_above - self.cand}
+        self.new_result = self.last
+
+
 class Analyzer:
     def __init__(self, ring, rate, nfft, avg_s=1.0):
         self.ring = ring
@@ -241,6 +442,7 @@ class Analyzer:
         self.max_frames = max(1, 2_000_000 // nfft)
         self.freqs = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / rate))
         self.row_s = self.hop / rate                                 # seconds per waterfall row
+        self.avg_s = avg_s
         self.alpha = min(1.0, self.row_s / max(avg_s, self.row_s))   # time-average weight
         self.next_pos = None
         self.ema = None         # time-averaged power, per bin
@@ -254,6 +456,14 @@ class Analyzer:
         self.keep = None
         self.group = 1
         self.freq_khz = None
+        self.peak_db = None     # peak hold of the displayed trace, per bin; cleared by configure()
+
+        self.skip_tx = False      # Tx Test mode
+        self.tx = None          # TxDetector, made by configure()
+
+    def set_avg(self, on):
+        """Time-average the waterfall over avg_s seconds, or show each row's own power."""
+        self.alpha = min(1.0, self.row_s / max(self.avg_s, self.row_s)) if on else 1.0
 
     def configure(self, tune_hz, lo_off, hi_off, settle_s=0.0):
         """Set the displayed bins (offsets from tuning, Hz) and reset averaging."""
@@ -261,11 +471,13 @@ class Analyzer:
         nb = int(self.keep.sum())
         self.group = max(1, int(np.ceil(nb / MAX_DISPLAY_COLS)))
         self.freq_khz = self.reduce((tune_hz + self.freqs[self.keep]) / 1e3)
+        self.tx = TxDetector(self.freq_khz, self.row_s)
         self.ema = None
         self.bg = None
         self.gated_s = None
         self.n_rows = 0
         self.ema_long = None
+        self.peak_db = None
         if settle_s > 0:
             self.next_pos = self.ring.total + int(settle_s * self.rate)
         else:
@@ -334,6 +546,13 @@ class Analyzer:
             rows_db = 10 * np.log10(out + 1e-20) - bgs
             spec_db = 10 * np.log10(self.ema + 1e-20) - self.bg
         self.spec_avg_db = 10 * np.log10(self.ema_long + 1e-20) - (0.0 if self.raw else self.bg)
+        n0 = self.n_rows - pr.shape[0]
+        for i in range(pr.shape[0]):
+            counted = self.tx.feed((n0 + i + 1) * self.row_s, out[i], rows_db[i])
+            if not self.skip_tx:
+                counted = [rows_db[i]]
+            for row in counted:
+                self.peak_db = row.copy() if self.peak_db is None else np.maximum(self.peak_db, row)
         return rows_db.astype(np.float32), spec_db
 
 # ------------------------------------------------------------ FT8 decoding
@@ -461,6 +680,9 @@ def run_decode(z, rate, slot_time, tune_hz, disp_off, span_hz, jt9_path, shm_dir
             os.remove(path)
         except OSError:
             pass
+    if proc.returncode != 0:
+        first = (proc.stderr.strip().splitlines() or ["no error text"])[0]
+        raise RuntimeError(f"jt9 exit {proc.returncode}: {first}")
     recs = []
     for ln in text.splitlines():
         m = DECODE_RE.match(ln)
@@ -492,6 +714,7 @@ class DecodeBridge(QtCore.QObject):
     decode = QtCore.Signal(object)
     status = QtCore.Signal(str)
     done = QtCore.Signal()
+    count = QtCore.Signal(object)   # valid decodes in one slot: {"s0", "mode", "n"}
 
 # ------------------------------------------------------------ GUI
 
@@ -618,6 +841,10 @@ class StatsWindow(QtWidgets.QWidget):
         self.table.setSortingEnabled(True)
         self.table.sortItems(3, QtCore.Qt.SortOrder.DescendingOrder)     # busiest senders first
         header = self.table.horizontalHeader()
+        # The Windows native style ignores per-section background brushes, so the sorted column's
+        # highlight disappeared (white title on a light header). Fusion paints it on every platform.
+        self._header_style = QtWidgets.QStyleFactory.create("Fusion")
+        header.setStyle(self._header_style)
         header.sortIndicatorChanged.connect(self._mark_sort_column)
         self._mark_sort_column(3, QtCore.Qt.SortOrder.DescendingOrder)
         self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
@@ -746,6 +973,56 @@ class DecodePopout(QtWidgets.QWidget):
         ev.accept()
 
 
+class FreqEntry(QtWidgets.QWidget):
+    """Tuned frequency in MHz as six digits; each digit has its own up and down arrow."""
+
+    requested = QtCore.Signal(int)                      # wanted tuning frequency, Hz
+    PLACES_HZ = [100_000_000, 10_000_000, 1_000_000, 100_000, 10_000, 1_000]
+
+    def __init__(self):
+        super().__init__()
+        self._hz = 0
+        font = QtGui.QFont("monospace")
+        font.setPointSize(14)
+        font.setBold(True)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self.digits = []
+        for i, place in enumerate(self.PLACES_HZ):
+            if i == 3:                                  # decimal point after the MHz digits
+                dot = QtWidgets.QLabel(".")
+                dot.setFont(font)
+                lay.addWidget(dot)
+            col = QtWidgets.QVBoxLayout()
+            col.setSpacing(0)
+            up = QtWidgets.QToolButton()
+            up.setArrowType(QtCore.Qt.ArrowType.UpArrow)
+            lab = QtWidgets.QLabel("0")
+            lab.setFont(font)
+            lab.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            dn = QtWidgets.QToolButton()
+            dn.setArrowType(QtCore.Qt.ArrowType.DownArrow)
+            col.addWidget(up)
+            col.addWidget(lab)
+            col.addWidget(dn)
+            up.clicked.connect(lambda _=False, p=place: self._step(p))
+            dn.clicked.connect(lambda _=False, p=place: self._step(-p))
+            lay.addLayout(col)
+            self.digits.append(lab)
+        lay.addWidget(QtWidgets.QLabel("MHz"))
+        lay.addStretch(1)
+
+    def set_hz(self, hz):
+        """Show the tuned frequency on the digits."""
+        self._hz = int(hz)
+        for lab, ch in zip(self.digits, f"{round(hz / 1000):06d}"):
+            lab.setText(ch)
+
+    def _step(self, delta_hz):
+        self.requested.emit(self._hz + delta_hz)
+
+
 class AudioOffsetAxis(pg.AxisItem):
     """Top axis of the waterfall: audio offset in Hz from the tuned (dial) frequency."""
 
@@ -770,12 +1047,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tune_hz = tune_hz          # hardware tuning frequency, Hz
         self.disp_off = disp_off        # display centre relative to tuning, Hz
         self.span_hz = span_hz          # display width, Hz
-        self.step_hz = STEPS[DEFAULT_STEP_INDEX][1]
         self.jt9_path = jt9_path
         self.shm_dir = shm_dir
         self.all_txt = all_txt
         self.cfg_version = 0            # bumped on retune/span change
         self.cur_slot = None            # (boundary_time, sample_index, cfg_version)
+        self.paused = False             # True: receiver stopped, display frozen
+        self.noise_blk = 0
+        self.blue_mode = "avg"          # blue trace: "avg" (15 s average) or "peak" (peak hold)
+        self.spec_y = None              # raw-mode spectrum y range currently set, (lo, hi) dB
         self.decoding = False
         self.decode_times = deque()     # slot start times of decodes in the rate window
         self.decode_t0 = None           # when decoding was switched on; None while off
@@ -799,10 +1079,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.valid_rows = 0
         self.wf = None
 
+        self.slot_counts = []           # [{"s0", "s1", "n", "item"}] decode count per slot, for the strip
         self.bridge = DecodeBridge()
         self.bridge.decode.connect(self._on_decode)
         self.bridge.status.connect(self._on_decode_status)
         self.bridge.done.connect(self._on_decode_done)
+        self.bridge.count.connect(self._on_slot_count)
 
         self.spec = pg.PlotWidget(title="Spectrum")
         self.spec.setLabel("left", "SNR", units="dB")
@@ -826,12 +1108,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wf_plot.setMouseEnabled(x=False, y=False)
         self.img = pg.ImageItem()
         self.wf_plot.addItem(self.img)
+        self.wf_plot.getAxis("top").setHeight(COUNT_AXIS_H)
+        self.wf_plot.getAxis("bottom").setHeight(COUNT_AXIS_H)
+        # narrow strip right of the waterfall: one decode count per slot, scrolls with the rows
+        self.count_plot = pg.PlotWidget()
+        self.count_plot.setFixedWidth(COUNT_STRIP_W)
+        self.count_plot.hideAxis("left")
+        self.count_plot.hideAxis("right")
+        self.count_plot.showAxis("top")
+        self.count_plot.showAxis("bottom")
+        for name in ("top", "bottom"):
+            self.count_plot.getAxis(name).setStyle(showValues=False)
+            self.count_plot.getAxis(name).setHeight(COUNT_AXIS_H)
+        self.count_plot.setMouseEnabled(x=False, y=False)
+        self.count_plot.setMenuEnabled(False)
+        self.count_plot.hideButtons()
+        self.count_plot.setYLink(self.wf_plot)
+        self.count_plot.disableAutoRange()
+        self.count_plot.setXRange(0.0, 1.0, padding=0)
+        # spacer under the spectrum, so its frequency axis still lines up with the waterfall's
+        self.count_spacer = QtWidgets.QWidget()
+        self.count_spacer.setFixedWidth(COUNT_STRIP_W)
         self.lut_rgba = pg.colormap.get("viridis").getLookupTable(
             0.0, 1.0, 256, alpha=True, mode="byte")          # (256, 4) uint8
 
         # --- controls row
-        self.btn_up = QtWidgets.QPushButton("▲ Up")
-        self.btn_down = QtWidgets.QPushButton("▼ Down")
         self.btn_save = QtWidgets.QPushButton("Save PNG")
         self.btn_popout = QtWidgets.QPushButton("Pop out")
         self.btn_marks = QtWidgets.QPushButton("Mark")
@@ -860,10 +1161,6 @@ class MainWindow(QtWidgets.QMainWindow):
         for name, ft8_mhz, ft4_mhz in BANDS:
             self.band_box.addItem(name, (ft8_mhz, ft4_mhz))
         self.band_box.currentIndexChanged.connect(self.on_band)
-        self.step_box = QtWidgets.QComboBox()
-        for name, hz in STEPS:
-            self.step_box.addItem(name, hz)
-        self.step_box.setCurrentIndex(DEFAULT_STEP_INDEX)
         self.span_box = QtWidgets.QComboBox()
         for name, khz in SPAN_PRESETS:
             self.span_box.addItem(name, khz)
@@ -871,33 +1168,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self._select_span(span_hz / 1e3)
 
         controls = QtWidgets.QHBoxLayout()
-        controls.addWidget(self.btn_down)
-        controls.addWidget(self.btn_up)
-        controls.addWidget(QtWidgets.QLabel("Band:"))
+        self.freq_entry = FreqEntry()
+        self.freq_entry.requested.connect(self.tune_to)
+        controls.addWidget(self.freq_entry)
         controls.addWidget(self.band_box)
-        controls.addWidget(QtWidgets.QLabel("Step:"))
-        controls.addWidget(self.step_box)
         controls.addWidget(QtWidgets.QLabel("Span:"))
         controls.addWidget(self.span_box)
+        self.blue_box = QtWidgets.QComboBox()
+        self.blue_box.addItem("15 s average", "avg")
+        self.blue_box.addItem("Peak hold", "peak")
+        self.blue_box.addItem("Tx Test", "txskip")
+        self.blue_box.currentIndexChanged.connect(self._on_blue_mode)
+        controls.addWidget(self.blue_box)
+        self.btn_peak_reset = QtWidgets.QPushButton("Reset peak")
+        self.btn_peak_reset.clicked.connect(self._reset_peak)
+        controls.addWidget(self.btn_peak_reset)
+        self.btn_pause = QtWidgets.QPushButton("Pause")
+        self.btn_pause.setCheckable(True)
+        self.btn_pause.toggled.connect(self._set_paused)
+        controls.addWidget(self.btn_pause)
         controls.addWidget(self.btn_save)
         for btn in self.mode_buttons.values():
             controls.addWidget(btn)
-        controls.addWidget(self.btn_popout)
         controls.addWidget(self.btn_marks)
         controls.addWidget(self.btn_calls)
         self.chk_raw = QtWidgets.QCheckBox("Raw power")
         self.chk_raw.setChecked(True)
         controls.addWidget(self.chk_raw)
+        self.chk_avg = QtWidgets.QCheckBox("Time avg")
+        self.chk_avg.setChecked(False)
+        self.an.set_avg(False)          # startup default: no time average
+        self.chk_avg.toggled.connect(self.an.set_avg)
+        controls.addWidget(self.chk_avg)
         controls.addStretch(1)
-        self.tune_label = QtWidgets.QLabel()
-        controls.addWidget(self.tune_label)
+        self.btn_exit = QtWidgets.QPushButton("Exit")
+        controls.addWidget(self.btn_exit)
 
-        self.btn_up.clicked.connect(lambda: self.retune(+self.step_hz))
-        self.btn_down.clicked.connect(lambda: self.retune(-self.step_hz))
-        self.step_box.currentIndexChanged.connect(self.on_step)
         self.span_box.currentIndexChanged.connect(self.on_span)
         self.btn_save.clicked.connect(self.save_png)
         self.btn_popout.clicked.connect(self.pop_out)
+        self.btn_exit.clicked.connect(self.exit_app)
         self.btn_marks.toggled.connect(self._set_marks_visible)
         self.btn_calls.toggled.connect(self._set_calls_visible)
         self.mode_group.idClicked.connect(self._on_mode_clicked)
@@ -911,7 +1221,9 @@ class MainWindow(QtWidgets.QMainWindow):
         status_row = QtWidgets.QHBoxLayout()
         self.rate_label = QtWidgets.QLabel()
         status_row.addWidget(self.status)
+        self.tx_label = QtWidgets.QLabel()
         status_row.addWidget(self.rate_label)
+        status_row.addWidget(self.tx_label)
         status_row.addWidget(self.msg, 1)
         status_row.addWidget(self.version_label)
 
@@ -920,20 +1232,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spec.disableAutoRange(axis="y")            # stop y-autoranging from changing labels
         self.wf_plot.disableAutoRange(axis="x")
 
+        spec_row = QtWidgets.QHBoxLayout()
+        spec_row.setContentsMargins(0, 0, 0, 0)
+        spec_row.setSpacing(0)
+        spec_row.addWidget(self.spec, 1)
+        spec_row.addWidget(self.count_spacer)
+        wf_row = QtWidgets.QHBoxLayout()
+        wf_row.setContentsMargins(0, 0, 0, 0)
+        wf_row.setSpacing(0)
+        wf_row.addWidget(self.wf_plot, 1)
+        wf_row.addWidget(self.count_plot)
         central = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(central)
         lay.addLayout(controls)
-        lay.addWidget(self.spec, 1)
-        lay.addWidget(self.wf_plot, 2)
+        lay.addLayout(spec_row, 1)
+        lay.addLayout(wf_row, 2)
         lay.addLayout(status_row)
         self.setCentralWidget(central)
-        self.resize(1200, 900)
+        self.resize(1200 + COUNT_STRIP_W, 900)     # widened so the waterfall keeps its width
+        self._set_count_strip(self.mode is not None)
 
         # --- decodes: docked along the bottom, or popped out into its own window
         self.decode_pane = DecodeWindow()
         self.decode_dock = QtWidgets.QDockWidget("FT8 decodes", self)
         self.decode_dock.setObjectName("decodes_dock")
         self.decode_dock.setWidget(self.decode_pane)
+        self.decode_pane.top_bar.layout().addWidget(self.btn_popout)
+        self.btn_clear_log = QtWidgets.QPushButton("Clear log")
+        self.btn_clear_log.setVisible(False)
+        self.btn_clear_log.clicked.connect(self._clear_log)
+        self.decode_pane.top_bar.layout().addWidget(self.btn_clear_log)
+        self.chk_noise = QtWidgets.QCheckBox("Noise stats")
+        self.chk_noise.setChecked(True)
+        self.chk_noise.setVisible(False)
+        self.decode_pane.top_bar.layout().addWidget(self.chk_noise)
         self.decode_dock.setFeatures(
             QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetClosable
             | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable)
@@ -971,6 +1303,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wf_plot.scene().sigMouseMoved.connect(self._on_hover)
         self.wf_plot.viewport().installEventFilter(self)
 
+    # ---- exit: close every window, then leave app.exec() so main() releases the radio
+    def exit_app(self):
+        self.popout.close()             # re-docks the pane if it was popped out; harmless otherwise
+        self.stats_win.close()
+        self.close()
+        QtWidgets.QApplication.quit()
+
     # ---- decodes pane: pop out / dock back
     def pop_out(self):
         if not self.popped:
@@ -988,8 +1327,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.popped:
             return
         self.decode_dock.setWidget(self.decode_pane)                 # moves the decodes window back
-        self.decode_pane.top_bar.layout().addWidget(self.decode_pane.btn_stats)
-        self.decode_pane.top_bar.layout().addWidget(self.decode_pane.btn_split)
+        # keep the order: Stats, Two panes, Pop out (the Pop out button stayed in the bar)
+        self.decode_pane.top_bar.layout().insertWidget(1, self.decode_pane.btn_stats)
+        self.decode_pane.top_bar.layout().insertWidget(2, self.decode_pane.btn_split)
         self.decode_pane.top_bar.show()
         self.popped = False
         self.popout.hide()
@@ -1020,13 +1360,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.an.configure(self.tune_hz, lo, hi, settle_s=SETTLE_S if settle else 0.0)
         self.f0 = float(self.an.freq_khz[0])
         self.f1 = float(self.an.freq_khz[-1])
+        self.spec_y = None
 
     def _refresh(self):
         self.off_axis.tune_hz = float(self.tune_hz)     # audio offset is measured from the dial
         self.off_axis.picture = None
         self.spec.setXRange(self.f0, self.f1, padding=0)
         self.wf_plot.setXRange(self.f0, self.f1, padding=0)
-        self.tune_label.setText(f"Tune {self.tune_hz / 1e6:.6f} MHz")
+        self.freq_entry.set_hz(self.tune_hz)
         self.setWindowTitle(f"Airspy HF+  {self.tune_hz / 1e6:.6f} MHz")
         clipped = self.span_hz > FT8_AUDIO_MAX_SPAN
         self.status.setText(
@@ -1044,6 +1385,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.an.raw = on
         self.spec.setLabel("left", "Power" if on else "SNR", units="dB")
         self.spec.setYRange(-10 if on else -5, 40, padding=0)   # fixed scale in both modes
+        self.spec_y = None
+        self.an.peak_db = None
         self.levels = None if on else self.fixed_levels    # colour range is re-set for the new units
         if self.rows:
             self._realloc(self.rows)                        # history is in the other units: clear it
@@ -1051,6 +1394,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- decode mode: FT8, FT4 or off (one at a time)
     def _on_mode_clicked(self, mid):
         mode = {0: "FT8", 1: "FT4", 2: None}[mid]
+        if mode is not None and self.an.skip_tx:
+            self.blue_box.setCurrentIndex(self.blue_box.findData("peak"))
         if mode == self.mode:
             return
         self._set_mode(mode)
@@ -1059,6 +1404,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_mode(self, mode):
         self.mode = mode
+        self._clear_slot_counts()
+        self._set_count_strip(mode is not None)
         if mode is not None and mode != self.stats_mode:    # Stats cover one mode at a time
             self.stats = {}
             self.stats_mode = mode
@@ -1143,6 +1490,86 @@ class MainWindow(QtWidgets.QMainWindow):
                  else f"{span / 60:.1f} min so far")
         self.rate_label.setText(f"   {name} rate: {n * 3600 / span:.0f}/h ({basis})")
 
+    def tune_to(self, hz):
+        self.retune(hz - self.tune_hz)
+
+    def _on_blue_mode(self, _idx):
+        self.blue_mode = self.blue_box.currentData()
+        self.an.skip_tx = self.blue_mode == "txskip"
+        self.spec.plotItem.legend.getLabel(self.spec_avg_curve).setText(self.blue_box.currentText())
+        if self.an.skip_tx:
+            self._enter_tx_mode()
+        else:
+            self._leave_tx_mode()
+
+    def _enter_tx_mode(self):
+        self.an.tx.reset_events()
+        self._set_mode(None)                    # Tx Test and FT8/FT4 are mutually exclusive
+        self.mode_buttons["Off"].setChecked(True)
+        self.decode_dock.setWindowTitle("Tx log")
+        self.btn_clear_log.setVisible(True)
+        self.chk_noise.setVisible(True)
+        self.noise_blk = int(time.time() // NOISE_REPORT_S)
+        self.tx_label.setText("Tx Test: listening")
+
+    def _leave_tx_mode(self):
+        self.tx_label.setText("")
+        self.btn_clear_log.setVisible(False)
+        self.chk_noise.setVisible(False)
+        self.decode_dock.setWindowTitle("Decodes")
+
+    def _log_tx(self, r):
+        self.decode_pane.append(tx_line(r, self.an.raw), False)
+
+    def _log_noise(self, rep):
+        self.decode_pane.append(tx_noise_line(rep), False)
+
+    def _clear_log(self):
+        for view in (self.decode_pane.view, self.decode_pane.view_cq, self.decode_pane.view_other):
+            view.clear()
+
+    def _update_tx_label(self):
+        tx = self.an.tx
+        unit = "(raw)" if self.an.raw else "(SNR)"
+        if tx.active and tx.center is not None:
+            pk = "--" if tx.tx_peak is None else f"{tx.tx_peak:+.1f}"
+            text = (f"Tx in progress: {self.an.freq_khz[tx.center] / 1e3:.4f} MHz, "
+                    f"peak {pk} dB {unit}")
+        elif tx.last is not None:
+            text = "Last Tx: " + tx_line(tx.last, self.an.raw)
+        else:
+            text = "Tx Test: listening"
+        self.tx_label.setText(text)
+
+    def _set_paused(self, on):
+        self.paused = on
+        self.btn_pause.setText("Resume" if on else "Pause")
+        if on:
+            self.radio.stop()
+            self.msg.setText("Paused: receiver stopped")
+            return
+        self.cur_slot = None                    # no decode of the slot that straddles the pause
+        self.an.next_pos = None                 # resync the analyzer with the ring
+        self.an.tx.reset_events()
+        if self.radio.start():
+            self.msg.setText("")
+        else:
+            self.msg.setText("airspyhf_start() failed")
+
+    def _reset_peak(self):
+        self.an.peak_db = None
+
+    def _fit_spec_y(self, spec_db, blue):
+        """Raw power: fit the spectrum axis to the traces, so the floor is fixed at RAW_Y_MIN_DB and the top follows the traces."""
+        lo = RAW_Y_MIN_DB
+        hi = math.ceil(float(np.max(spec_db)))
+        if blue is not None:
+            hi = max(hi, math.ceil(float(np.max(blue))))
+        hi += 5
+        if self.spec_y is None or abs(lo - self.spec_y[0]) > 3 or abs(hi - self.spec_y[1]) > 3:
+            self.spec_y = (lo, hi)                      # small changes are ignored: no label jitter
+            self.spec.setYRange(lo, hi, padding=0)
+
     # ---- control callbacks
     def retune(self, delta_hz):
         new = self.tune_hz + delta_hz
@@ -1158,9 +1585,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._configure(settle=True)
         self._refresh()
         self.msg.setText("")
-
-    def on_step(self, _idx):
-        self.step_hz = self.step_box.currentData()
 
     def on_span(self, _idx):
         self.manual_tuned = True
@@ -1333,6 +1757,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for rec in recs:
                 rec["s0"] = start_idx              # sample index of the slot start
             stamp = time.strftime("%H:%M:%S", time.gmtime(slot_time))
+            self.bridge.count.emit({"s0": start_idx, "mode": mode, "n": len(recs)})
             self.bridge.status.emit(f"Slot {stamp} UTC: {len(recs)} decodes")
             for rec in recs:
                 self.bridge.decode.emit(rec)
@@ -1412,6 +1837,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.decoding = False
         self._update_rate()     # once per FT8 slot, after that slot's decodes have been counted
 
+    # ---- decode count strip beside the waterfall
+    def _set_count_strip(self, on):
+        self.count_plot.setVisible(on)
+        self.count_spacer.setVisible(on)
+
+    def _clear_slot_counts(self):
+        for e in self.slot_counts:
+            if e["item"] is not None:
+                self.count_plot.removeItem(e["item"])
+        self.slot_counts = []
+
+    def _on_slot_count(self, info):
+        if info["mode"] != self.mode:           # slot decoded under the previous mode
+            return
+        span = int(round(MODES[info["mode"]]["slot_s"] * self.rate))
+        self.slot_counts.append({"s0": info["s0"], "s1": info["s0"] + span,
+                                 "n": info["n"], "item": None})
+        self.dirty = True
+
+    def _sync_count_labels(self):
+        """Centre each slot's decode count on that slot's rows in the strip."""
+        if self.newest_s is None or not self.rows:
+            return
+        keep = []
+        for e in self.slot_counts:
+            r0 = self._row_index(e["s0"])
+            r1 = self._row_index(e["s1"])
+            if r1 < 0:                          # scrolled off the top: forget it
+                if e["item"] is not None:
+                    self.count_plot.removeItem(e["item"])
+                continue
+            keep.append(e)
+            if e["item"] is None:
+                item = pg.TextItem(str(e["n"]), color=(200, 200, 200), anchor=(0.5, 0.5),
+                                   fill=pg.mkBrush(0, 0, 0, 170))
+                item.setFont(QtGui.QFont("sans-serif", 9))
+                self.count_plot.addItem(item)
+                e["item"] = item
+            lo, hi = max(r0, 0), min(r1, self.rows - 1)
+            e["item"].setPos(0.5, ((lo + hi) / 2 + 0.5 - self.rows) * self.row_s)
+        self.slot_counts = keep
+
     # ---- waterfall
     def _realloc(self, h):
         """Make the waterfall exactly h rows, one row per screen pixel."""
@@ -1490,11 +1957,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.show_marks and self.ov is not None:
             rgba[self.ov == 1] = MARK_RGBA_OTHER
             rgba[self.ov == 2] = MARK_RGBA_CQ
+        if self.show_marks and self.mode is not None and self.newest_s is not None:
+            self._paint_slot_lines(rgba)
         self.img.setImage(np.ascontiguousarray(rgba.transpose(1, 0, 2)), autoLevels=False)
         self.img.setRect(QtCore.QRectF(self.f0, -self.rows * self.row_s,
                                        self.f1 - self.f0, self.rows * self.row_s))
 
+    def _paint_slot_lines(self, rgba):
+        """Draw one row across the waterfall at each decode slot boundary (FT8 15 s, FT4 7.5 s)."""
+        slot_s = MODES[self.mode]["slot_s"]
+        now = time.time()
+        b = math.ceil((now - self.rows * self.row_s) / slot_s) * slot_s
+        while b <= now:
+            r = self._row_index(self._index_at(now, b))
+            if 0 <= r < self.rows:
+                rgba[r, :] = SLOT_LINE_RGBA
+            b += slot_s
+
     def tick(self):
+        if self.paused:
+            return
         h = int(self.wf_plot.getViewBox().height())
         if h > 10 and h != self.rows:
             self._realloc(h)
@@ -1512,6 +1994,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cur_slot = (slot_b, self._index_at(now, slot_b), self.cfg_version)
 
         rows_db, spec_db = self.an.process()
+        if self.an.skip_tx:
+            self._update_tx_label()
+            blk = int(time.time() // NOISE_REPORT_S)
+            if blk != self.noise_blk:
+                self.noise_blk = blk
+                rep = self.an.tx.take_noise_report()
+                if rep is not None and self.chk_noise.isChecked():
+                    self._log_noise(rep)
+            res = self.an.tx.new_result
+            if res is not None:
+                self.an.tx.new_result = None
+                self._log_tx(res)
         if rows_db is not None and self.wf is not None:
             k = min(rows_db.shape[0], self.rows)
             if k < self.rows:
@@ -1529,7 +2023,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.levels = (float(lo), hi)                # frozen after this
 
             self.spec_curve.setData(self.an.freq_khz, spec_db)
-            self.spec_avg_curve.setData(self.an.freq_khz, self.an.spec_avg_db)
+            blue = self.an.peak_db if self.blue_mode in ("peak", "txskip") else self.an.spec_avg_db
+            if blue is not None:
+                self.spec_avg_curve.setData(self.an.freq_khz, blue)
+            if self.an.raw:
+                self._fit_spec_y(spec_db, blue)
             self.dirty = True
 
         # One image update per change: waterfall pixels and marks together
@@ -1538,6 +2036,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._paint_marks()
             self._compose()
             self._sync_call_labels()
+            self._sync_count_labels()
             self.dirty = False
 
 # ------------------------------------------------------------ main
@@ -1659,6 +2158,7 @@ def main():
 
         an = Analyzer(ring, rate, args.nfft)
         radio = Radio(lib, dev)
+        radio.cb = rx.cb       # kept so the receiver can be restarted after a pause
         app = QtWidgets.QApplication(sys.argv)
         win = MainWindow(an, radio, ring, low_if,
                          title=f"Airspy HF+  {args.freq:.6f} MHz",
