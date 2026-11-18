@@ -36,7 +36,7 @@ import scipy.fft as sfft
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.15.10"
+VERSION = "0.15.12"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -65,6 +65,7 @@ SPAN_PRESETS = [
     ("500 Hz", 0.5),
     ("3 kHz", 3.0),
     ("6 kHz", 6.0),
+    ("12 kHz", 12.0),
     ("20 kHz", 20.0),
     ("100 kHz", 100.0),
     ("350 kHz", 350.0),
@@ -1349,9 +1350,23 @@ class MainWindow(QtWidgets.QMainWindow):
                                     "border: 1px solid #00c8ff; color: #00c8ff;")
         self.spec.scene().sigMouseMoved.connect(self._on_spec_hover)
         self.spec.viewport().installEventFilter(self)
+        self.spec_marker = pg.ScatterPlotItem(symbol="o", size=12, pen=pg.mkPen("w", width=2),
+                                              brush=pg.mkBrush(0, 0, 0, 0))
+        self.spec_marker.setVisible(False)
+        self.spec.addItem(self.spec_marker)
 
     # ---- exit: close every window, then leave app.exec() so main() releases the radio
+    def _detach_filters(self):
+        self.timer.stop()
+        self.spec.viewport().removeEventFilter(self)
+        self.wf_plot.viewport().removeEventFilter(self)
+
+    def closeEvent(self, ev):
+        self._detach_filters()
+        super().closeEvent(ev)
+
     def exit_app(self):
+        self._detach_filters()
         self.popout.close()             # re-docks the pane if it was popped out; harmless otherwise
         self.stats_win.close()
         self.close()
@@ -1703,26 +1718,32 @@ class MainWindow(QtWidgets.QMainWindow):
                         QtCore.QUrl(f"https://www.qrz.com/db/{self.pop_mark['call']}"))
         if obj is self.spec.viewport():
             if ev.type() == QtCore.QEvent.Type.Leave:
-                self.spec_pop.hide()
+                self._hide_spec_readout()
         return super().eventFilter(obj, ev)
+
+    def _hide_spec_readout(self):
+        self.spec_pop.hide()
+        self.spec_marker.setVisible(False)
 
     def _on_spec_hover(self, scene_pos):
         vb = self.spec.getViewBox()
         x_data, y_data = self.spec_avg_curve.getData()
         if (x_data is None or len(x_data) == 0 or y_data is None
                 or not vb.sceneBoundingRect().contains(scene_pos)):
-            self.spec_pop.hide()
+            self._hide_spec_readout()
             return
         p = vb.mapSceneToView(scene_pos)
         x0, x1 = vb.viewRange()[0]
         khz_per_px = (x1 - x0) / max(vb.width(), 1)
         idx = np.flatnonzero(np.abs(x_data - p.x()) <= SPEC_SNAP_PX * khz_per_px)
         if idx.size == 0:
-            self.spec_pop.hide()
+            self._hide_spec_readout()
             return
         i = idx[int(np.argmax(y_data[idx]))]
         unit = "(raw)" if self.an.raw else "(SNR)"
         self.spec_pop.setText(f"{x_data[i] / 1000.0:.4f} MHz   {y_data[i]:+.1f} dB {unit}")
+        self.spec_marker.setData([x_data[i]], [y_data[i]])
+        self.spec_marker.setVisible(True)
         self.spec_pop.adjustSize()
         self.spec_pop.move(QtGui.QCursor.pos() + QtCore.QPoint(18, 18))
         self.spec_pop.show()
@@ -2273,4 +2294,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
