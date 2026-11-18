@@ -8,7 +8,7 @@ Decodes are appended to ALL.TXT in the current directory and shown in a pane at 
 bottom of the window, or in a separate window after "Pop out". CQ decodes are
 highlighted there and can be marked on the waterfall.
 
--J.Beale N8JUF  17-Nov-2025
+-J.Beale N8JUF  17-Nov-2026
 
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
@@ -36,7 +36,7 @@ import scipy.fft as sfft
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.15.5"
+VERSION = "0.15.10"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -57,7 +57,7 @@ RATE_WINDOW_S = 15 * 60         # decode-rate window: most recent 15 minutes
 RATE_MIN_SPAN_S = 60.0          # below this much elapsed time the rate is shown as "--"
 MY_GRID = "CN85"                # own Maidenhead grid square, for distances in the hover popup
 
-RAW_Y_MIN_DB = -30.0            # lowest spectrum axis value in Raw power mode, for this receiver
+SPEC_SNAP_PX = 10               # hover readout snaps to the highest blue-trace point this close
 COUNT_STRIP_W = 34              # width of the decode-count strip beside the waterfall, px
 COUNT_AXIS_H = 50               # height of the top and bottom axes of the waterfall column, px
 
@@ -79,6 +79,7 @@ BANDS = [
     ("10 m", 28.074, 28.180), ("2 m", 144.174, 144.170),
 ]
 BAND_SPAN_KHZ = 3.0             # display width when a band is selected, as at startup
+BAND_SPAN_OVERRIDE_KHZ = {"2 m": 100.0}   # bands that need a wider display when selected
 
 # Decoding: one mode at a time, via WSJT-X's jt9
 FT8_AUDIO_RATE = 12_000
@@ -235,7 +236,8 @@ class Receiver:
 # ------------------------------------------------------------ DSP
 
 # Tx Test: a transmission is a block of spectrum this far above the background reference
-TX_THRESHOLD_DB = 4.0           # on the TX_STAT_KHZ-average excess, searched in the central 50%
+TX_THRESHOLD_DB = 6.0           # on the TX_STAT_KHZ-average excess above band median, central 50%
+TX_MAX_BW_KHZ = 25.0            # wider than this above threshold is not a voice transmission
 TX_STAT_KHZ = 2.0               # detection statistic: power averaged over this width
 TX_MIN_S = 1.5                  # continuous time above threshold needed to confirm a transmission
 TX_GAP_S = 0.3                  # a dropout shorter than this does not end a transmission
@@ -266,7 +268,7 @@ def tx_noise_line(rep):
     """One log line of background noise stats."""
     stamp = time.strftime("%H:%M", time.gmtime(rep["wall"]))
     return (f"{stamp} UTC  NOISE  floor {rep['floor']:.1f} dB (raw, central 50%)  "
-            f"2 kHz-avg excess max {rep['max']:+.1f} dB, mean {rep['mean']:+.2f} dB, "
+            f"2 kHz-avg excess above median, max {rep['max']:+.1f} dB, mean {rep['mean']:+.2f} dB, "
             f"threshold {TX_THRESHOLD_DB:.1f} dB  over {rep['rows']} rows")
 
 
@@ -303,23 +305,34 @@ class TxDetector:
         self.noise_sum += mean
         self.noise_n += 1
 
-    def take_noise_report(self):
-        """Noise stats since the last call, or None if there is nothing to report. Resets them."""
+    def take_noise_report(self, reset=True):
+        """Noise stats since the last reset, or None if there is nothing to report.
+        reset=False reads them without clearing the accumulators (for Check Noise)."""
         if self.ref_lin is None or self.noise_n == 0:
-            self._reset_noise()
+            if reset:
+                self._reset_noise()
             return None
         rep = {"wall": time.time(),
                "floor": float(np.median(10 * np.log10(self.ref_lin[self.center_mask] + 1e-30))),
                "max": float(self.noise_max),
                "mean": self.noise_sum / self.noise_n,
                "rows": self.noise_n}
-        self._reset_noise()
+        if reset:
+            self._reset_noise()
         return rep
 
     def reset_events(self):
         """Forget any candidate or transmission in progress (keeps the background reference)."""
         self._drop_candidate()
         self.new_result = None
+
+    def reset_reference(self):
+        """Discard the background reference and re-measure it from the next warm-up period."""
+        self._drop_candidate()
+        self.ref_lin = None
+        self.ref_s = None
+        self.warm_sum = None
+        self.warm_n = 0
 
     def _drop_candidate(self):
         self.cand = None        # row time at which the current candidate began
@@ -335,6 +348,15 @@ class TxDetector:
         self.tx_abs = None      # per-column sum of linear power over the counted rows
         self.tx_lin = None      # per-column sum of power relative to the peak's level
         self.last = None
+
+    def _width_khz(self, S):
+        """Width of the contiguous columns around the candidate centre at or above threshold."""
+        lo = hi = self.center
+        while lo > 0 and S[lo - 1] >= TX_THRESHOLD_DB:
+            lo -= 1
+        while hi < len(S) - 1 and S[hi + 1] >= TX_THRESHOLD_DB:
+            hi += 1
+        return float(self.freq_khz[hi] - self.freq_khz[lo])
 
     def _track_ref(self, lin):
         w = self.row_s / TX_REF_TAU_S
@@ -352,6 +374,7 @@ class TxDetector:
                 self.ref_s = self._smooth(self.ref_lin, self.n_stat)
             return [disp]
         S = 10 * np.log10(self._smooth(lin, self.n_stat) / self.ref_s + 1e-30)
+        S = S - float(np.median(S[self.center_mask]))     # remove band-wide floor changes
         if self.cand is None:
             masked = np.where(self.center_mask, S, -np.inf)
             idx = int(np.argmax(masked))
@@ -379,6 +402,11 @@ class TxDetector:
         if t >= self.cand + TX_SKIP_S:
             self.queue.append((t, disp, lin, float(disp[self.mask].max())))
         if not self.active and self.last_above - self.cand >= TX_MIN_S:
+            if self._width_khz(S) > TX_MAX_BW_KHZ:
+                out.extend(d for _, d, _, _ in self.queue)     # too wide: not voice
+                self._drop_candidate()
+                out.append(disp)
+                return out
             self.active = True
             self.tx_start = time.time() - (t - self.cand)
         if self.active:
@@ -1212,6 +1240,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_calls.toggled.connect(self._set_calls_visible)
         self.mode_group.idClicked.connect(self._on_mode_clicked)
         self.chk_raw.toggled.connect(self._on_raw_toggled)
+        self.spec.setLabel("left", "Power" if self.chk_raw.isChecked() else "SNR", units="dB")
 
         # --- one status line: radio/FFT info, transient messages, version
         self.status = QtWidgets.QLabel()
@@ -1266,6 +1295,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_noise.setChecked(True)
         self.chk_noise.setVisible(False)
         self.decode_pane.top_bar.layout().addWidget(self.chk_noise)
+        self.btn_ref_reset = QtWidgets.QPushButton("Ref reset")
+        self.btn_ref_reset.setVisible(False)
+        self.btn_ref_reset.clicked.connect(self._ref_reset)
+        self.decode_pane.top_bar.layout().addWidget(self.btn_ref_reset)
+        self.btn_check_noise = QtWidgets.QPushButton("Check Noise")
+        self.btn_check_noise.setVisible(False)
+        self.btn_check_noise.clicked.connect(self._check_noise)
+        self.decode_pane.top_bar.layout().addWidget(self.btn_check_noise)
+        self.chk_noise.toggled.connect(self._sync_check_btn)
         self.decode_dock.setFeatures(
             QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetClosable
             | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable)
@@ -1302,6 +1340,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pop_hide.timeout.connect(self._hide_popup)
         self.wf_plot.scene().sigMouseMoved.connect(self._on_hover)
         self.wf_plot.viewport().installEventFilter(self)
+
+        # --- spectrum hover readout: frequency and level of the highest blue-trace point nearby
+        self.spec_pop = QtWidgets.QLabel(self, QtCore.Qt.WindowType.ToolTip)
+        self.spec_pop.setFont(QtGui.QFont("sans-serif", 11))
+        self.spec_pop.setMargin(6)
+        self.spec_pop.setStyleSheet("background-color: rgba(0, 0, 0, 220); "
+                                    "border: 1px solid #00c8ff; color: #00c8ff;")
+        self.spec.scene().sigMouseMoved.connect(self._on_spec_hover)
+        self.spec.viewport().installEventFilter(self)
 
     # ---- exit: close every window, then leave app.exec() so main() releases the radio
     def exit_app(self):
@@ -1354,6 +1401,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- configuration
     def _configure(self, settle):
+        self.spec_y = None              # refit the spectrum axis to the new span
         half = self.rate / 2
         lo = max(self.disp_off - self.span_hz / 2, -half)
         hi = min(self.disp_off + self.span_hz / 2, half)
@@ -1452,7 +1500,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.msg.setText("No standard FT4 frequency on this band")
             return
         self.manual_tuned = True
-        self._tune_window(dial, dial * 1e3, dial * 1e3 + BAND_SPAN_KHZ)
+        name = self.band_box.currentText()
+        if name in BAND_SPAN_OVERRIDE_KHZ:
+            half = BAND_SPAN_OVERRIDE_KHZ[name] / 2
+            self._tune_window(dial, dial * 1e3 - half, dial * 1e3 + half)
+        else:
+            self._tune_window(dial, dial * 1e3, dial * 1e3 + BAND_SPAN_KHZ)
 
     def _sync_band(self):
         """Show the band-menu entry whose FT8 or FT4 dial matches the current frequency, or 'Band...'."""
@@ -1509,6 +1562,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.decode_dock.setWindowTitle("Tx log")
         self.btn_clear_log.setVisible(True)
         self.chk_noise.setVisible(True)
+        self.btn_ref_reset.setVisible(True)
+        self.btn_check_noise.setVisible(True)
+        self._sync_check_btn(self.chk_noise.isChecked())
         self.noise_blk = int(time.time() // NOISE_REPORT_S)
         self.tx_label.setText("Tx Test: listening")
 
@@ -1516,6 +1572,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tx_label.setText("")
         self.btn_clear_log.setVisible(False)
         self.chk_noise.setVisible(False)
+        self.btn_ref_reset.setVisible(False)
+        self.btn_check_noise.setVisible(False)
         self.decode_dock.setWindowTitle("Decodes")
 
     def _log_tx(self, r):
@@ -1523,6 +1581,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _log_noise(self, rep):
         self.decode_pane.append(tx_noise_line(rep), False)
+
+    def _sync_check_btn(self, on):
+        self.btn_check_noise.setEnabled(bool(on))
+
+    def _ref_reset(self):
+        self.an.tx.reset_reference()
+        stamp = time.strftime("%H:%M:%S", time.gmtime())
+        self.decode_pane.append(f"{stamp} UTC  reference reset, re-measuring background", False)
+
+    def _check_noise(self):
+        rep = self.an.tx.take_noise_report(reset=False)
+        if rep is None:
+            self.decode_pane.append("noise check: reference not ready yet", False)
+            return
+        self._log_noise(rep)
 
     def _clear_log(self):
         for view in (self.decode_pane.view, self.decode_pane.view_cq, self.decode_pane.view_other):
@@ -1560,8 +1633,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.an.peak_db = None
 
     def _fit_spec_y(self, spec_db, blue):
-        """Raw power: fit the spectrum axis to the traces, so the floor is fixed at RAW_Y_MIN_DB and the top follows the traces."""
-        lo = RAW_Y_MIN_DB
+        """Raw power: fit the spectrum axis to the traces. The floor is 5 dB below the 5th percentile
+        of the live trace in the current span; the top sits 5 dB above the highest trace."""
+        lo = math.floor(float(np.percentile(spec_db, 5))) - 5
         hi = math.ceil(float(np.max(spec_db)))
         if blue is not None:
             hi = max(hi, math.ceil(float(np.max(blue))))
@@ -1627,7 +1701,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self._mark_at(p.x(), p.y()) is self.pop_mark:
                     QtGui.QDesktopServices.openUrl(
                         QtCore.QUrl(f"https://www.qrz.com/db/{self.pop_mark['call']}"))
+        if obj is self.spec.viewport():
+            if ev.type() == QtCore.QEvent.Type.Leave:
+                self.spec_pop.hide()
         return super().eventFilter(obj, ev)
+
+    def _on_spec_hover(self, scene_pos):
+        vb = self.spec.getViewBox()
+        x_data, y_data = self.spec_avg_curve.getData()
+        if (x_data is None or len(x_data) == 0 or y_data is None
+                or not vb.sceneBoundingRect().contains(scene_pos)):
+            self.spec_pop.hide()
+            return
+        p = vb.mapSceneToView(scene_pos)
+        x0, x1 = vb.viewRange()[0]
+        khz_per_px = (x1 - x0) / max(vb.width(), 1)
+        idx = np.flatnonzero(np.abs(x_data - p.x()) <= SPEC_SNAP_PX * khz_per_px)
+        if idx.size == 0:
+            self.spec_pop.hide()
+            return
+        i = idx[int(np.argmax(y_data[idx]))]
+        unit = "(raw)" if self.an.raw else "(SNR)"
+        self.spec_pop.setText(f"{x_data[i] / 1000.0:.4f} MHz   {y_data[i]:+.1f} dB {unit}")
+        self.spec_pop.adjustSize()
+        self.spec_pop.move(QtGui.QCursor.pos() + QtCore.QPoint(18, 18))
+        self.spec_pop.show()
 
     def _mark_at(self, x_khz, y_s):
         """Most recent decoded box with a callsign under the given plot coordinates, or None."""
@@ -2175,3 +2273,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
