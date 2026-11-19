@@ -8,7 +8,9 @@ Decodes are appended to ALL.TXT in the current directory and shown in a pane at 
 bottom of the window, or in a separate window after "Pop out". CQ decodes are
 highlighted there and can be marked on the waterfall.
 
--J.Beale N8JUF  17-Nov-2026
+A WWV timing mode logs the clock offset of the receiver and the carrier frequency.
+
+-J.Beale N8JUF  19-Nov-2026
 
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
@@ -16,8 +18,11 @@ Examples:
     ./airspy_live.py --no-decode                  # display only
 """
 import argparse
+import csv
 import ctypes
 import ctypes.util
+import io
+import json
 import os
 import math
 import re
@@ -29,14 +34,15 @@ import threading
 import time
 import wave
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import scipy.fft as sfft
+import scipy.signal as ssig
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.15.12"
+VERSION = "0.18.7"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -252,6 +258,42 @@ TX_BW_DB = 6.0                  # occupied bandwidth: contiguous columns within 
 TX_DELAY_S = TX_GAP_S + TX_SKIP_S   # rows are held this long, so the last TX_SKIP_S can be dropped
 NOISE_REPORT_S = 600            # noise stats are logged on UTC multiples of this
 
+# WWV timing mode
+WWV_FREQS_MHZ = [("2.5 MHz", 2.5), ("5 MHz", 5.0), ("10 MHz", 10.0), ("15 MHz", 15.0),
+                 ("20 MHz", 20.0)]           # menu entries; the manual frequency entry still works
+WWV_DEFAULT_MHZ = 10.0
+WWV_SPAN_KHZ = 3.0                           # display width centred on the carrier
+WWV_TONES_HZ = (1000.0, 1200.0, 1500.0)      # WWV seconds and minute, WWVH, WWV hour marker
+WWV_TONE_HALF_BW_HZ = 80.0
+WWV_DEC_RATE = 8000                          # envelope rate after decimation, S/s
+WWV_LP_HZ = 3500.0                           # envelope lowpass before decimation
+WWV_DETECT_DB = 15.0                         # tone onset: this far above the median envelope
+WWV_SEG_S = 3.0                              # analysis window, re-run every second
+WWV_EDGE_S = 0.75                            # a second is decided only when all its peaks lie this far
+                                             # inside the window, so a tick's sidelobes are never split across passes
+WWV_MF_DETECT_DB = 14.0                      # matched-filter peak: this far above the median output
+WWV_TICK_LEN_S = 0.005                       # tick template length
+WWV_MARKER_LEN_S = 0.8                       # marker template length
+WWV_TICK_MIN_FRAC = 0.3                      # tick amplitude, relative to the strongest tick in the window
+WWV_NO_TICK_SEC = (29, 59)                  # seconds with no tick: any tick detected there is noise
+WWV_DECIDE_MARGIN_S = 1.0                   # a second is decided once the trusted window passes it by this much
+WWV_MARKER_COVER = 0.9                       # share of the 800 ms marker that must carry the 1 kHz tone
+WWV_QUIET_COVER = 0.3                       # share of the quiet span before a marker allowed to carry the tone
+WWV_QUIET_SPAN_S = (0.6, 0.1)               # quiet span before a marker onset (WWV sends no tick at second 59)
+WWV_MISS_SAVES_PER_HOUR = 6                 # cap on automatic envelope WAVs for minutes with no accepted marker
+WWV_MISS_SPAN_S = (3.0, 2.0)                # saved span around a missed minute: from 3 s before to 2 s after
+WWV_SHORT_S = 0.02                          # short tone window for the coverage test
+WWV_TICK_S = (0.002, 0.05)                   # 5 ms seconds ticks
+WWV_MARKER_S = (0.5, 1.2)                    # 800 ms minute and hour markers
+WWV_CARRIER_S = 10.0                         # carrier frequency and strength measured over this span
+WWV_CAPTURE_S = 10.0               # length of the raw IQ and envelope capture
+WWV_CARRIER_SEARCH_HZ = 3000.0
+WWV_SETTLE_S = 4.0                           # a minute is reported this long after it ends
+WWV_MAP_LAG_S = 1.0                          # ring samples map to wall time one second later: markers then fall on second 0
+WWV_HIST_S = 130.0                           # envelope history kept for the per-minute 100 Hz analysis
+WWV_FRAME_BAND_HZ = (90.0, 110.0)           # band of the 100 Hz time-code subcarrier in the envelope
+WWV_FRAME_EDGE_MS = 30.0                    # time-code pulses start 30 ms into the second (NIST SP 250-67)
+
 
 def tx_line(r, raw):
     """One log line for a finished transmission."""
@@ -459,6 +501,417 @@ class TxDetector:
                      "snr": snr,
                      "dur": self.last_above - self.cand}
         self.new_result = self.last
+
+
+# ------------------------------------------------------------ WWV timing
+
+def wwv_ms(v):
+    return "--" if v is None else f"{v:+.1f} ms"
+
+
+def wwv_tones(rec):
+    return "+".join(str(t) for t in rec["tones"]) or "--"
+
+
+def wwv_off_ms(w):
+    """Offset of a time from the nearest whole UTC second, in ms. Positive: this clock is ahead."""
+    return (w - round(w)) * 1000.0
+
+
+def wwv_line(rec, mhz):
+    """One decode-pane line for a completed UTC minute."""
+    stamp = time.strftime("%H:%M", time.gmtime(rec["wall"]))
+    car = rec["carrier"]
+    cs = ("carrier --" if car is None else
+          f"carrier {car['hz']:+.2f} Hz ({car['ppm']:+.3f} ppm), SNR {car['snr']:+.1f} dB")
+    tone = "--" if rec["tone_db"] is None else f"{rec['tone_db']:.1f} dB"
+    return (f"{stamp} UTC  WWV {mhz:.3f} MHz  clock {wwv_ms(rec['clock_ms'])} ({rec['n']} marks)  "
+            f"marker {wwv_ms(rec['marker_ms'])}  {cs}  tone peak/median {tone}  "
+            f"tones {wwv_tones(rec)}")
+
+
+class WwvMonitor:
+    """WWV timing. Finds the time-signal tones in the AM envelope of the tuned carrier, gives each
+    one's offset from the nearest whole UTC second, and once a minute reports the carrier's offset
+    from the nominal frequency and its strength. Reads the ring buffer directly, so the display
+    span does not matter."""
+
+    def __init__(self, ring, rate, nominal_hz, log_path=None, minute_log_path=None):
+        self.ring = ring
+        self.rate = rate
+        self.dec = int(round(rate / WWV_DEC_RATE))
+        self.fs = rate / self.dec
+        self.sos_lp = ssig.butter(4, WWV_LP_HZ, btype="low", fs=rate, output="sos")
+        self.templates = {(f, kind): self._template(f, dur)
+                          for f in WWV_TONES_HZ
+                          for kind, dur in (("tick", WWV_TICK_LEN_S), ("marker", WWV_MARKER_LEN_S))}
+        self.short_templates = {f: self._template(f, WWV_SHORT_S) for f in WWV_TONES_HZ}
+        self.nominal_hz = nominal_hz
+        self.file = None
+        self.log = None
+        if log_path:
+            self.start_onset_log(log_path)
+        self.minute_file = open(minute_log_path, "w", newline="") if minute_log_path else None
+        self.minute_log = csv.writer(self.minute_file) if self.minute_file else None
+        if self.minute_log is not None:
+            self.minute_log.writerow(["utc_minute", "wall_s", "marks", "markers", "clock_ms",
+                                      "tick_ms", "marker_ms", "frame100_ms", "frame100_contrast",
+                                      "carrier_hz", "carrier_ppm", "carrier_snr_db", "tone_db",
+                                      "tones", "nominal_hz", "marker_1k_n", "marker_cov",
+                                      "marker_quiet", "marker_db"])
+        self.reset()
+
+    def start_onset_log(self, path):
+        """Write every accepted and rejected onset to a CSV file (debugging aid)."""
+        self.stop_onset_log()
+        self.file = open(path, "w", newline="")
+        self.log = csv.writer(self.file)
+        self.log.writerow(["wall_s", "tone_hz", "kind", "ratio_db", "phase_ms",
+                           "sec_of_minute", "nominal_hz"])
+
+    def stop_onset_log(self):
+        if self.file is not None:
+            self.file.close()
+        self.file = None
+        self.log = None
+
+    def close(self):
+        self.stop_onset_log()
+        if self.minute_file is not None:
+            self.minute_file.close()
+            self.minute_file = None
+            self.minute_log = None
+
+    def reset(self):
+        """Forget streaming state and pending events (on start and after any retune)."""
+        self.pos = None                          # next ring sample to read
+        self.primed = False                      # filter state set from the first samples
+        self.zi_re = np.zeros((self.sos_lp.shape[0], 2))
+        self.zi_im = np.zeros((self.sos_lp.shape[0], 2))
+        self.env = np.zeros(0)                   # recent envelope, decimated to self.fs
+        self.hist = np.zeros(0)                  # longer envelope history for the 100 Hz analysis
+        self.env_end = 0                         # absolute decimated index just after env[-1]
+        self.next_seg = 0                        # analyse when env_end reaches this
+        self.done_keys = set()                   # UTC seconds already decided
+        self.events = []                         # {"w", "tone", "kind"} not yet reported
+        self.recent = deque(maxlen=600)          # same events, kept for WWV captures
+        self.minute = None                       # UTC minute being collected
+        self.tone_db = None                      # strongest tone-to-median ratio this minute, dB
+        self.pending = {}                        # UTC second -> candidates, decided once the window passes it
+        self.recent_markers = deque(maxlen=20)   # recently accepted markers, for plateau removal
+        self.marker_diag = []                    # every 1 kHz marker candidate seen, before the gates
+        self.miss_saves = deque(maxlen=200)      # wall times of automatic miss captures
+
+    def set_nominal(self, hz):
+        self.nominal_hz = hz
+        self.reset()
+
+    def _wall(self, d, total, now):
+        """Wall-clock time of decimated index d, from the ring position at time now."""
+        return now - (total - d * self.dec) / self.rate + WWV_MAP_LAG_S
+
+    def process(self, now=None):
+        """Read new samples, analyse once a second, and return the minutes completed since the last call.
+        now: wall-clock time of the newest sample (default: the system clock; the self-test passes its own)."""
+        ring, dec = self.ring, self.dec
+        total = ring.total
+        now = time.time() if now is None else now
+        if total < self.rate // 2:
+            return []
+        if self.minute is None:
+            self.minute = int(now // 60)
+        if self.pos is None or total - self.pos > ring.size:
+            self.pos = total
+        start = self.pos
+        if total > start:
+            x = ring.read(start, total - start)
+            if x is None:
+                self.pos = None
+                return []
+            self.pos = total
+            if not self.primed:                 # start from steady state, not from zero
+                self.zi_re = ssig.sosfilt_zi(self.sos_lp) * float(x.real[0])
+                self.zi_im = ssig.sosfilt_zi(self.sos_lp) * float(x.imag[0])
+                self.primed = True
+            yr, self.zi_re = ssig.sosfilt(self.sos_lp, x.real.astype(np.float64), zi=self.zi_re)
+            yi, self.zi_im = ssig.sosfilt(self.sos_lp, x.imag.astype(np.float64), zi=self.zi_im)
+            off = (-start) % dec
+            new = np.hypot(yr, yi)[off::dec]
+            self.env = np.concatenate([self.env, new])[-int((WWV_SEG_S + 1.0) * self.fs):]
+            self.hist = np.concatenate([self.hist, new])[-int(WWV_HIST_S * self.fs):]
+            self.env_end = (start + off) // dec + len(new)
+        seg_n = int(WWV_SEG_S * self.fs)
+        if len(self.env) >= seg_n and self.env_end >= self.next_seg:
+            self.next_seg = self.env_end + int(self.fs)
+            self._analyse(total, now)
+        if now >= (self.minute + 1) * 60 + WWV_SETTLE_S:
+            rec = self._finish_minute(self.minute, total, now)
+            self._log_minute(rec)
+            if rec["marker_n"] == 0:
+                self._save_marker_miss(rec, total, now)
+            self.minute += 1
+            return [rec]
+        return []
+
+    def _template(self, f, dur):
+        """Complex tone burst of length dur at f: the matched filter for a tick or a marker."""
+        L = int(round(dur * self.fs)) | 1               # odd length, so the kernel has a centre sample
+        t = (np.arange(L) - (L - 1) / 2) / self.fs
+        return np.exp(-2j * np.pi * f * t)
+
+    def _analyse(self, total, now):
+        """Matched-filter search for each tone's 5 ms tick and 800 ms marker template. A candidate
+        must reach a fraction of the strongest tick in the window, a tick inside a marker is that
+        marker's plateau, and each UTC second keeps only its strongest candidate."""
+        fs = self.fs
+        seg_n = int(WWV_SEG_S * fs)
+        seg = self.env[-seg_n:]
+        seg_start = self.env_end - seg_n          # absolute decimated index of seg[0]
+        x = seg - float(np.mean(seg))             # the carrier's steady envelope is not a signal
+        edge = int(WWV_EDGE_S * fs)
+        trusted = seg_n - edge                    # peaks must lie inside this range
+
+        # pass 1: matched outputs, ticks first so the reference amplitude is known
+        found, ref = [], 0.0
+        for kind in ("tick", "marker"):
+            for (f, k), h in self.templates.items():
+                if k != kind:
+                    continue
+                m = np.abs(ssig.fftconvolve(x, h, mode="same"))
+                med = float(np.median(m)) + 1e-12
+                db = 20.0 * math.log10((float(m.max()) + 1e-12) / med)
+                self.tone_db = db if self.tone_db is None else max(self.tone_db, db)
+                if kind == "tick":
+                    ref = max(ref, float(m.max()) / len(h))
+                pk, _ = ssig.find_peaks(m, height=med * 10.0 ** (WWV_MF_DETECT_DB / 20.0),
+                                        distance=int(0.5 * fs))
+                found.append((f, kind, h, m, pk))
+
+        # local 1 kHz level every 20 ms, against the window's noise: a true marker carries the tone
+        # over all 800 ms and is quiet just before its onset
+        short, thr_s = {}, {}
+        for f, hs in self.short_templates.items():
+            s = np.abs(ssig.fftconvolve(x, hs, mode="same")) / len(hs)
+            short[f] = s
+            thr_s[f] = float(np.median(s)) * 10.0 ** (WWV_MF_DETECT_DB / 20.0) + 1e-12
+
+        # pass 2: candidates
+        cands = []
+        for f, kind, h, m, pk in found:
+            half = (len(h) - 1) // 2
+            for p in pk:
+                p = int(p)
+                if p >= trusted or p - half < edge or p + half >= seg_n:
+                    continue                      # not fully inside the trusted part of the window
+                amp = float(m[p]) / len(h)        # same units for every template
+                if kind == "marker":
+                    s, t = short[f], thr_s[f]
+                    cov = float(np.mean(s[p - half:p + half + 1] > t))
+                    onset = p - half                  # marker onset: the quiet span lies before it
+                    a = onset - int(WWV_QUIET_SPAN_S[0] * fs)
+                    b = onset - int(WWV_QUIET_SPAN_S[1] * fs)
+                    quiet = float(np.mean(s[a:b] > t)) if a >= 0 else 0.0
+                    if f == 1000.0:                   # diagnostics: every candidate, accepted or not
+                        self.marker_diag.append({
+                            "w": self._wall(seg_start + p - half, total, now),
+                            "cov": cov, "quiet": quiet,
+                            "db": 20.0 * math.log10(float(m[p]) / np.median(m) + 1e-12)})
+                    if cov < WWV_MARKER_COVER or quiet > WWV_QUIET_COVER:
+                        continue                  # partial overlap with a tick train, or tone before onset
+                elif amp < WWV_TICK_MIN_FRAC * ref:
+                    continue                      # leakage from a stronger tick
+                w = self._wall(seg_start + p - half, total, now)
+                if kind == "tick" and int(round(w)) % 60 in WWV_NO_TICK_SEC:
+                    continue                      # WWV sends no tick at seconds 29 and 59
+                cands.append({"w": w, "key": int(round(w)), "tone": f, "kind": kind,
+                              "db": 20.0 * math.log10(float(m[p]) / np.median(m) + 1e-12),
+                              "amp": amp})
+
+        # candidates wait in self.pending until their second is well inside the trusted window:
+        # a marker that completes later in the window must still compete with that second's ticks
+        for c in cands:
+            lst = self.pending.setdefault(c["key"], [])
+            if not any(o["tone"] == c["tone"] and o["kind"] == c["kind"] and abs(o["w"] - c["w"]) < 0.05
+                       for o in lst):
+                lst.append(c)
+        t_ok = self._wall(seg_start + trusted, total, now)
+        newest = None
+        for key in sorted(k for k in self.pending if k + WWV_DECIDE_MARGIN_S <= t_ok):
+            group = self.pending.pop(key)
+            if key in self.done_keys:
+                continue
+            self.done_keys.add(key)
+            newest = key
+            # a tick inside an accepted marker's span (same tone) is that marker's plateau
+            marks = [c for c in group if c["kind"] == "marker"] + list(self.recent_markers)
+            group = [c for c in group if c["kind"] == "marker" or not any(
+                mk["tone"] == c["tone"] and mk["w"] - 0.02 <= c["w"] <= mk["w"] + WWV_MARKER_LEN_S + 0.02
+                for mk in marks)]
+            # an accepted marker (800 cycles) outranks any tick (5 cycles); among equals, strongest wins
+            group.sort(key=lambda c: (c["kind"] == "marker", c["amp"]), reverse=True)
+            for i, c in enumerate(group):
+                if self.log is not None:
+                    self.log.writerow([f"{c['w']:.4f}", int(c["tone"]),
+                                       c["kind"] if i == 0 else "rejected",
+                                       f"{c['db']:.2f}", f"{wwv_off_ms(c['w']):+.2f}",
+                                       key % 60, int(self.nominal_hz)])
+                if i == 0:
+                    ev = {"w": c["w"], "tone": c["tone"], "kind": c["kind"]}
+                    self.events.append(ev)
+                    self.recent.append(ev)
+                    if c["kind"] == "marker":
+                        self.recent_markers.append({"w": c["w"], "tone": c["tone"]})
+        if newest is not None:
+            self.done_keys = {k for k in self.done_keys if k >= newest - 60}
+        for k in [k for k in self.pending if k < t_ok - 120]:
+            del self.pending[k]
+        if self.file is not None:
+            self.file.flush()
+
+    def _frame100(self, M, total, now):
+        """Where the 100 Hz time-code edge falls within the second (ms, positive: this clock ahead),
+        folded over UTC minute M. Zero-phase filtering, so the edge is not delayed."""
+        n = len(self.hist)
+        if n < 10:
+            return None, None
+        t_last = self._wall(self.env_end - 1, total, now)     # wall time of hist[-1]
+        t0, t1 = M * 60 - 1.0, M * 60 + 61.0                  # one second of margin each side
+        j0 = n - 1 - int(round((t_last - t0) * self.fs))
+        j1 = n - 1 - int(round((t_last - t1) * self.fs))
+        if j0 < 0 or j1 > n - 1 or j1 - j0 < int(60 * self.fs):
+            return None, None
+        seg = self.hist[j0:j1 + 1]
+        tt = (t_last - M * 60) - (n - 1 - np.arange(j0, j1 + 1)) / self.fs
+        sos = ssig.butter(4, list(WWV_FRAME_BAND_HZ), btype="bandpass", fs=self.fs, output="sos")
+        bp = ssig.sosfiltfilt(sos, seg - float(np.mean(seg)))
+        e = np.abs(ssig.hilbert(bp))
+        b = np.floor(np.mod(tt, 1.0) * 1000.0).astype(int) % 1000
+        cnt = np.bincount(b, minlength=1000)
+        F = np.bincount(b, weights=e, minlength=1000) / np.maximum(cnt, 1)
+        # rising edge: mean over the next 100 ms minus mean over the previous 100 ms
+        cs = np.concatenate([F, F, F]).cumsum()
+        phi = np.arange(1000)
+        nxt = (cs[phi + 1000 + 100 - 1] - cs[phi + 1000 - 1]) / 100.0
+        prv = (cs[phi + 1000 - 1] - cs[phi + 1000 - 101]) / 100.0
+        score = nxt - prv
+        k = int(np.argmax(score))
+        contrast = float(score[k] / (F.std() + 1e-12))
+        ms = (k - 1000 if k > 500 else k) - WWV_FRAME_EDGE_MS
+        ms = ms + 1000 if ms <= -500 else (ms - 1000 if ms > 500 else ms)
+        return float(ms), contrast
+
+    def _log_minute(self, rec):
+        if self.minute_log is None:
+            return
+        def f(v, p=1):
+            return "" if v is None else f"{v:+.{p}f}"
+        car = rec["carrier"]
+        self.minute_log.writerow([
+            time.strftime("%Y-%m-%d %H:%M", time.gmtime(rec["wall"])), rec["wall"], rec["n"],
+            rec["marker_n"], f(rec["clock_ms"]), f(rec["tick_ms"]), f(rec["marker_ms"]),
+            f(rec["frame100_ms"]), "" if rec["frame100_contrast"] is None else f"{rec['frame100_contrast']:.2f}",
+            "" if car is None else f"{car['hz']:+.2f}", "" if car is None else f"{car['ppm']:+.3f}",
+            "" if car is None else f"{car['snr']:+.1f}",
+            "" if rec["tone_db"] is None else f"{rec['tone_db']:.1f}",
+            wwv_tones(rec), int(self.nominal_hz), rec["marker_1k_n"],
+            _opt(rec["marker_cov"], 2), _opt(rec["marker_quiet"], 2), _opt(rec["marker_db"], 1)])
+        self.minute_file.flush()
+
+    def _save_marker_miss(self, rec, total, now):
+        """Save a 5 s envelope WAV and JSON sidecar around a minute with no accepted 1 kHz marker,
+        at most WWV_MISS_SAVES_PER_HOUR per hour, so the detector can be checked against it."""
+        while self.miss_saves and self.miss_saves[0] < now - 3600.0:
+            self.miss_saves.popleft()
+        if len(self.miss_saves) >= WWV_MISS_SAVES_PER_HOUR:
+            return None
+        M = int(rec["wall"] // 60)
+        n = len(self.hist)
+        t_last = self._wall(self.env_end - 1, total, now)     # wall time of hist[-1]
+        t0, t1 = M * 60 - WWV_MISS_SPAN_S[0], M * 60 + WWV_MISS_SPAN_S[1]
+        j0 = n - 1 - int(round((t_last - t0) * self.fs))
+        j1 = n - 1 - int(round((t_last - t1) * self.fs))
+        if n < 10 or j0 < 0 or j1 > n - 1 or j1 <= j0:
+            return None
+        seg = self.hist[j0:j1 + 1]
+        peak = float(np.max(np.abs(seg))) or 1.0
+        pcm = np.clip(seg / peak * 0.9 * 32767, -32767, 32767).astype("<i2")
+        base = os.path.join(os.getcwd(), f"wwv_miss_{time.strftime('%Y%m%d_%H%M', time.gmtime(M * 60))}")
+        wav_path, json_path = base + "_env8k.wav", base + "_info.json"
+        with wave.open(wav_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self.fs)
+            w.writeframes(pcm.tobytes())
+        info = {
+            "minute_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(M * 60)),
+            "window_start_utc": datetime.fromtimestamp(t0, timezone.utc).isoformat(timespec="milliseconds"),
+            "window_span_s": [-WWV_MISS_SPAN_S[0], WWV_MISS_SPAN_S[1]],
+            "sample_rate_hz": self.fs,
+            "clock_offset_ms_minute": rec["clock_ms"],
+            "marker_1k_candidates": rec["marker_1k_n"],
+            "best_candidate": {"cov": rec["marker_cov"], "quiet": rec["marker_quiet"],
+                               "db": rec["marker_db"]},
+            "candidates": [{"wall_s": round(d["w"], 4), "cov": round(d["cov"], 3),
+                            "quiet": round(d["quiet"], 3), "db": round(d["db"], 2)}
+                           for d in rec["diag"]],
+            "note": ("Envelope (3.5 kHz lowpass, 8 kHz rate, peak-normalised), not raw audio. "
+                     "Saved because no 1 kHz marker was accepted in this minute."),
+        }
+        with open(json_path, "w") as f:
+            json.dump(info, f, indent=2)
+        self.miss_saves.append(now)
+        return wav_path, json_path
+
+    def _carrier(self, total):
+        """Carrier offset from the nominal frequency (Hz, ppm) and its SNR in a 4 Hz band."""
+        n = int(WWV_CARRIER_S * self.rate)
+        if total < n:
+            return None
+        x = self.ring.read(total - n, n)
+        if x is None:
+            return None
+        P = np.abs(sfft.fft(x * np.hanning(n).astype(np.float32), workers=-1)) ** 2
+        f = sfft.fftfreq(n, 1.0 / self.rate)
+        idx = np.flatnonzero((np.abs(f) <= WWV_CARRIER_SEARCH_HZ) & (np.abs(f) >= 0.5))
+        k = idx[int(np.argmax(P[idx]))]
+        fpk = float(f[k])
+        dif = np.abs(f - fpk)
+        sig = dif <= 2.0
+        noise = (dif >= 2000.0) & (dif <= 2800.0)
+        p_sig = float(P[sig].sum())
+        p_noise = float(np.median(P[noise])) / math.log(2.0)   # mean power per bin of noise
+        snr = 10.0 * math.log10(p_sig / (int(sig.sum()) * p_noise + 1e-30) + 1e-30)
+        return {"hz": fpk, "ppm": fpk / self.nominal_hz * 1e6, "snr": snr}
+
+    def _finish_minute(self, M, total, now):
+        """Summarise the onsets of UTC minute M (events are assigned to the nearest second)."""
+        mine = [e for e in self.events if int(round(e["w"])) // 60 == M]
+        self.events = [e for e in self.events if int(round(e["w"])) // 60 > M]
+        ms = [wwv_off_ms(e["w"]) for e in mine]
+        ticks = [wwv_off_ms(e["w"]) for e in mine if e["kind"] == "tick"]
+        marks = [wwv_off_ms(e["w"]) for e in mine if e["kind"] == "marker"]
+        rec = {
+            "wall": M * 60,
+            "n": len(mine),
+            "clock_ms": float(np.median(ms)) if ms else None,
+            "tick_ms": float(np.median(ticks)) if ticks else None,
+            "marker_ms": float(np.median(marks)) if marks else None,
+            "tones": sorted({int(round(e["tone"])) for e in mine}),
+            "tone_db": self.tone_db,
+            "carrier": self._carrier(total),
+            "marker_n": len(marks),
+        }
+        diag = [d for d in self.marker_diag if int(round(d["w"])) // 60 == M]
+        self.marker_diag = [d for d in self.marker_diag if int(round(d["w"])) // 60 > M]
+        best = max(diag, key=lambda d: (d["cov"], d["db"])) if diag else None
+        rec["diag"] = diag
+        rec["marker_1k_n"] = len({int(round(d["w"])) for d in diag})   # distinct seconds with a candidate
+        rec["marker_cov"] = best["cov"] if best else None
+        rec["marker_quiet"] = best["quiet"] if best else None
+        rec["marker_db"] = best["db"] if best else None
+        rec["frame100_ms"], rec["frame100_contrast"] = self._frame100(M, total, now)
+        self.tone_db = None
+        return rec
 
 
 class Analyzer:
@@ -981,6 +1434,181 @@ class StatsWindow(QtWidgets.QWidget):
         self.table.horizontalHeader().setSortIndicatorShown(False)   # re-enabling sorting turns it on
 
 
+def _opt(v, p):
+    """Fixed-point text for a CSV cell, empty when there is no value."""
+    return "" if v is None else f"{v:.{p}f}"
+
+
+def write_wwv_capture(ring, rate, tune_hz, seconds=WWV_CAPTURE_S, outdir=None,
+                      events=(), clock_ms=None):
+    """Save the newest `seconds` as IQ (.npz), an 8 kHz envelope WAV and a JSON sidecar.
+
+    Wall times use the detector's mapping (newest sample = save time), so the sidecar onsets
+    and the window start share one reference. The filename uses the window start, which
+    carries the PC clock offset. The envelope WAV keeps the carrier level as DC.
+    Returns (iq_path, wav_path, json_path).
+    """
+    n = int(round(seconds * rate))
+    end = ring.total
+    if end < n:
+        raise RuntimeError("not enough samples yet")
+    x = ring.read(end - n, n)
+    if x is None:
+        raise RuntimeError("samples overwritten before they could be read")
+    now = time.time()
+    start_wall = now - n / rate + WWV_MAP_LAG_S
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime(start_wall))
+    base = os.path.join(outdir or os.getcwd(), f"wwv_{stamp}")
+    iq_path = base + "_iq.npz"
+    wav_path = base + "_env8k.wav"
+    json_path = base + "_info.json"
+
+    np.savez(iq_path, iq=x, rate=float(rate), tune_hz=float(tune_hz), wall_start=start_wall)
+
+    env = np.abs(x).astype(np.float64)
+    e8 = ssig.resample_poly(env, 1, int(rate // WWV_DEC_RATE))
+    peak = float(np.max(np.abs(e8))) or 1.0
+    pcm = np.clip(e8 / peak * 0.9 * 32767, -32767, 32767).astype("<i2")
+    with wave.open(wav_path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(WWV_DEC_RATE)
+        w.writeframes(pcm.tobytes())
+
+    onsets = [{"wall_s": round(e["w"], 4),
+               "offset_in_window_s": round(e["w"] - start_wall, 4),
+               "tone_hz": float(e["tone"]), "kind": e["kind"]}
+              for e in events if start_wall <= e["w"] <= now]
+    info = {
+        "window_start_utc": datetime.fromtimestamp(start_wall, timezone.utc).isoformat(timespec="milliseconds"),
+        "window_start_wall_s": round(start_wall, 4),
+        "window_seconds": seconds,
+        "sample_rate_hz": rate,
+        "tune_hz": tune_hz,
+        "save_wall_s": round(now, 4),
+        "ring_total_at_save": end,
+        "clock_offset_ms_last_minute": clock_ms,
+        "onsets": onsets,
+        "note": ("Wall times are the PC clock as the detector maps it (newest sample = save time). "
+                 "The window start in the filename carries the PC clock offset. Onsets are accepted "
+                 "detector events; the last ~1 s of the window may be missing because detection "
+                 "waits for later samples."),
+    }
+    with open(json_path, "w") as f:
+        json.dump(info, f, indent=2)
+    return iq_path, wav_path, json_path
+
+
+class WwvStatsWindow(QtWidgets.QWidget):
+    """WWV timing: one row per UTC minute, newest first. Updated as each minute completes."""
+
+    COLUMNS = ["UTC", "Clock (ms)", "Marks", "Tick med (ms)", "Marker (ms)", "100 Hz edge (ms)",
+               "100 Hz contrast", "Carrier (Hz)",
+               "Carrier (ppm)", "Carrier SNR (dB)", "Tone (dB)", "Tones"]
+    MAX_ROWS = 1440
+
+    def __init__(self, capture_fn=None, onset_log_fn=None):
+        super().__init__(None, QtCore.Qt.Window)
+        self.capture_fn = capture_fn
+        self.onset_log_fn = onset_log_fn
+        self.setWindowTitle("WWV timing")
+        self.resize(1040, 480)
+        self.recent = deque(maxlen=10)           # clock offsets of the latest minutes
+        self.summary = QtWidgets.QLabel("No minutes yet")
+        self.table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        note = QtWidgets.QLabel("Clock: positive means this computer's clock is ahead of UTC. "
+                                "Includes USB and buffer latency and propagation delay.")
+        btn_copy = QtWidgets.QPushButton("Copy CSV")
+        btn_copy.clicked.connect(self.copy_csv)
+        btn_save = QtWidgets.QPushButton("Save CSV...")
+        btn_save.clicked.connect(self.save_csv)
+        btn_cap = QtWidgets.QPushButton("Save 10 s...")
+        btn_cap.clicked.connect(self.save_capture)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(self.summary, 1)
+        top.addWidget(btn_copy)
+        top.addWidget(btn_save)
+        top.addWidget(btn_cap)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.addLayout(top)
+        lay.addWidget(self.table)
+        lay.addWidget(note)
+        self.cap_msg = QtWidgets.QLabel("")
+        lay.addWidget(self.cap_msg)
+        chk = QtWidgets.QCheckBox("Log every onset to CSV (debugging)")
+        chk.setChecked(False)
+        chk.toggled.connect(lambda on: self.onset_log_fn and self.onset_log_fn(on))
+        lay.addWidget(chk)
+
+    def add(self, rec, mhz):
+        car = rec["carrier"]
+        vals = [
+            time.strftime("%H:%M", time.gmtime(rec["wall"])),
+            wwv_ms(rec["clock_ms"]),
+            str(rec["n"]),
+            wwv_ms(rec["tick_ms"]),
+            wwv_ms(rec["marker_ms"]),
+            wwv_ms(rec.get("frame100_ms")),
+            "--" if rec.get("frame100_contrast") is None else f"{rec['frame100_contrast']:.2f}",
+            "--" if car is None else f"{car['hz']:+.2f}",
+            "--" if car is None else f"{car['ppm']:+.3f}",
+            "--" if car is None else f"{car['snr']:+.1f}",
+            "--" if rec["tone_db"] is None else f"{rec['tone_db']:.1f}",
+            wwv_tones(rec),
+        ]
+        self.table.insertRow(0)
+        for col, v in enumerate(vals):
+            self.table.setItem(0, col, QtWidgets.QTableWidgetItem(v))
+        while self.table.rowCount() > self.MAX_ROWS:
+            self.table.removeRow(self.table.rowCount() - 1)
+        if rec["clock_ms"] is not None:
+            self.recent.append(rec["clock_ms"])
+        if self.recent:
+            r = list(self.recent)
+            cs = ("" if car is None else
+                  f"   Carrier {car['hz']:+.2f} Hz ({car['ppm']:+.3f} ppm), SNR {car['snr']:+.1f} dB")
+            self.summary.setText(
+                f"{mhz:.3f} MHz   Clock last {r[-1]:+.1f} ms, median of last {len(r)} min "
+                f"{float(np.median(r)):+.1f} ms, range {min(r):+.1f} to {max(r):+.1f} ms{cs}")
+
+
+    def _table_csv(self):
+        """The whole table as CSV text, oldest minute first."""
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(self.COLUMNS)
+        for row in reversed(range(self.table.rowCount())):
+            w.writerow([self.table.item(row, c).text() if self.table.item(row, c) else ""
+                        for c in range(len(self.COLUMNS))])
+        return buf.getvalue()
+
+    def copy_csv(self):
+        QtWidgets.QApplication.clipboard().setText(self._table_csv())
+
+    def save_csv(self):
+        default = os.path.join(os.getcwd(), datetime.now().strftime("wwv_%Y%m%d_%H%M%S.csv"))
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save WWV timing table",
+                                                        default, "CSV files (*.csv)")
+        if path:
+            with open(path, "w", newline="") as f:
+                f.write(self._table_csv())
+
+
+    def save_capture(self):
+        if self.capture_fn is None:
+            self.cap_msg.setText("Capture not available")
+            return
+        try:
+            paths = self.capture_fn()
+            self.cap_msg.setText("Saved " + "   ".join(os.path.basename(p) for p in paths))
+        except Exception as e:
+            self.cap_msg.setText(f"Capture failed: {e}")
+
+
 class DecodePopout(QtWidgets.QWidget):
     """Free-floating decodes window. Closing it reports back so the pane can re-dock."""
 
@@ -1090,6 +1718,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.decode_t0 = None           # when decoding was switched on; None while off
         self.mode = None                # "FT8", "FT4", or None for decoding off
         self.manual_tuned = False       # True once the user has retuned or changed the span
+        self.wwv_on = False             # WWV timing mode: tuned to a WWV frequency, decoding off
+        self.wwv = None                 # WwvMonitor while wwv_on
+        self.onset_log_on = False       # write the onset CSV (debugging); set from the WWV window
+        self.wwv_mhz = WWV_DEFAULT_MHZ  # WWV frequency last chosen from the menu
 
         # Decode marks are drawn into the waterfall's own pixel buffer. Each mark records the
         # sample range of its slot, so it scrolls on the same clock as the waterfall rows.
@@ -1172,15 +1804,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_calls.setCheckable(True)
         self.btn_calls.setChecked(True)                 # on by default, as Mark
         self.show_call = True
-        self.mode_group = QtWidgets.QButtonGroup(self)
-        self.mode_buttons = {}
-        for mid, name in enumerate(("FT8", "FT4", "Off")):
-            btn = QtWidgets.QRadioButton(name)
-            btn.setEnabled(decode_ok or name == "Off")
-            self.mode_group.addButton(btn, mid)
-            self.mode_buttons[name] = btn
+        # mode menu: FT8, FT4, Off, and a WWV submenu (frequencies, timing window, capture)
+        self.mode_menu = QtWidgets.QMenu(self)
+        self.mode_actions = {}
+        for name in ("FT8", "FT4", "Off"):
+            a = self.mode_menu.addAction(name)
+            a.setCheckable(True)
+            a.triggered.connect(lambda _=False, n=name: self._on_mode_action(n))
+            self.mode_actions[name] = a
+        if not decode_ok:
+            for name in ("FT8", "FT4"):                 # both need jt9
+                self.mode_actions[name].setEnabled(False)
+        self.wwv_menu = self.mode_menu.addMenu("WWV")
+        self.wwv_actions = []
+        for name, mhz in WWV_FREQS_MHZ:
+            a = self.wwv_menu.addAction(f"WWV {name}")
+            a.setCheckable(True)
+            a.triggered.connect(lambda _=False, m=mhz: self._enter_wwv(m))
+            self.wwv_actions.append((mhz, a))
+        self.wwv_menu.addSeparator()
+        a_win = self.wwv_menu.addAction("Timing window...")
+        a_win.triggered.connect(self.show_wwv_stats)
+        a_cap = self.wwv_menu.addAction("Save 10 s capture")
+        a_cap.triggered.connect(self._menu_save_capture)
+        self.mode_btn = QtWidgets.QPushButton()
+        self.mode_btn.setMenu(self.mode_menu)
         start = "FT8" if (decode_start and decode_ok) else "Off"
-        self.mode_buttons[start].setChecked(True)
+        self._select_mode_box(start)
         if start != "Off":
             self.mode = start
             self.decode_t0 = time.time()
@@ -1217,8 +1867,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_pause.toggled.connect(self._set_paused)
         controls.addWidget(self.btn_pause)
         controls.addWidget(self.btn_save)
-        for btn in self.mode_buttons.values():
-            controls.addWidget(btn)
+        controls.addWidget(self.mode_btn)
         controls.addWidget(self.btn_marks)
         controls.addWidget(self.btn_calls)
         self.chk_raw = QtWidgets.QCheckBox("Raw power")
@@ -1239,7 +1888,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_exit.clicked.connect(self.exit_app)
         self.btn_marks.toggled.connect(self._set_marks_visible)
         self.btn_calls.toggled.connect(self._set_calls_visible)
-        self.mode_group.idClicked.connect(self._on_mode_clicked)
         self.chk_raw.toggled.connect(self._on_raw_toggled)
         self.spec.setLabel("left", "Power" if self.chk_raw.isChecked() else "SNR", units="dB")
 
@@ -1319,6 +1967,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.stats_win = StatsWindow(lambda: (self.stats, self.stats_mode))
         self.decode_pane.btn_stats.clicked.connect(self.show_stats)
+        self.wwv_win = WwvStatsWindow(capture_fn=self.save_wwv_capture,
+                                      onset_log_fn=self.set_onset_log)
 
         self._configure(settle=False)
         self._refresh()
@@ -1369,6 +2019,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._detach_filters()
         self.popout.close()             # re-docks the pane if it was popped out; harmless otherwise
         self.stats_win.close()
+        self.wwv_win.close()
         self.close()
         QtWidgets.QApplication.quit()
 
@@ -1441,7 +2092,17 @@ class MainWindow(QtWidgets.QMainWindow):
             + (" (3.8 kHz max)" if clipped else ""))
         if self.rows:
             self._realloc(self.rows)
+        if self.wwv_on:
+            if self.wwv is None:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                mlog = os.path.join(os.getcwd(), f"wwv_minutes_{stamp}.csv")
+                self.wwv = WwvMonitor(self.ring, self.rate, self.tune_hz, minute_log_path=mlog)
+                if self.onset_log_on:
+                    self.wwv.start_onset_log(self._onset_log_path())
+            elif self.wwv.nominal_hz != self.tune_hz:
+                self.wwv.set_nominal(self.tune_hz)      # any retune re-references the carrier
         self._sync_band()
+        self._sync_wwv_box()
 
     # ---- display mode: power above background (SNR) or absolute power
     def _on_raw_toggled(self, on):
@@ -1454,16 +2115,34 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.rows:
             self._realloc(self.rows)                        # history is in the other units: clear it
 
-    # ---- decode mode: FT8, FT4 or off (one at a time)
-    def _on_mode_clicked(self, mid):
-        mode = {0: "FT8", 1: "FT4", 2: None}[mid]
+    # ---- decode mode: FT8, FT4, WWV or off (one at a time)
+    def _on_mode_action(self, name):
+        mode = None if name == "Off" else name
+        if self.wwv_on:
+            self._leave_wwv()
         if mode is not None and self.an.skip_tx:
             self.blue_box.setCurrentIndex(self.blue_box.findData("peak"))
-        if mode == self.mode:
-            return
-        self._set_mode(mode)
-        if mode is not None and not self.manual_tuned:
-            self._shift_to(mode)
+        if mode != self.mode:
+            self._set_mode(mode)
+            if mode is not None and not self.manual_tuned:
+                self._shift_to(mode)
+        self._select_mode_box(name)
+
+    def _select_mode_box(self, name):
+        """Show a mode (FT8, FT4, WWV or Off) in the mode menu without firing its handler."""
+        for n, a in self.mode_actions.items():
+            a.setChecked(n == name)
+        for mhz, a in self.wwv_actions:
+            a.setChecked(name == "WWV" and abs(mhz - self.wwv_mhz) < 1e-6)
+        label = f"WWV {self.wwv_mhz:g} MHz" if name == "WWV" else name
+        self.mode_btn.setText(label + "  \u25BE")
+
+    def _menu_save_capture(self):
+        try:
+            paths = self.save_wwv_capture()
+            self.tx_label.setText("Saved " + "  ".join(os.path.basename(p) for p in paths))
+        except Exception as e:
+            self.tx_label.setText(f"Capture failed: {e}")
 
     def _set_mode(self, mode):
         self.mode = mode
@@ -1572,8 +2251,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _enter_tx_mode(self):
         self.an.tx.reset_events()
-        self._set_mode(None)                    # Tx Test and FT8/FT4 are mutually exclusive
-        self.mode_buttons["Off"].setChecked(True)
+        if self.wwv_on:
+            self._leave_wwv()
+        self._set_mode(None)                    # Tx Test, WWV and FT8/FT4 are mutually exclusive
+        self._select_mode_box("Off")
         self.decode_dock.setWindowTitle("Tx log")
         self.btn_clear_log.setVisible(True)
         self.chk_noise.setVisible(True)
@@ -1590,6 +2271,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_ref_reset.setVisible(False)
         self.btn_check_noise.setVisible(False)
         self.decode_dock.setWindowTitle("Decodes")
+
+    # ---- WWV timing mode: tuned to a WWV frequency with decoding off; separate from Tx Test
+    def _enter_wwv(self, mhz):
+        if self.an.skip_tx:
+            self.blue_box.setCurrentIndex(self.blue_box.findData("peak"))
+        self._set_mode(None)
+        self.wwv_mhz = mhz
+        self.wwv_on = True
+        self.decode_dock.setWindowTitle("WWV timing")
+        self.popout.setWindowTitle("WWV timing")
+        self._select_mode_box("WWV")
+        self._tune_window(mhz, mhz * 1e3 - WWV_SPAN_KHZ / 2, mhz * 1e3 + WWV_SPAN_KHZ / 2)
+        self.rate_label.setText("")
+        self.tx_label.setText(f"WWV {mhz:.3f} MHz: listening")
+
+    def _leave_wwv(self):
+        self.wwv_on = False
+        if self.wwv is not None:
+            self.wwv.close()
+        self.wwv = None
+        self.tx_label.setText("")
+        self.decode_dock.setWindowTitle("Decodes")
+        self.popout.setWindowTitle("Decodes")
+
+    def _sync_wwv_box(self):
+        """Tick the WWV submenu entry for the tuned frequency while WWV timing is on."""
+        f = self.tune_hz / 1e6
+        for mhz, a in self.wwv_actions:
+            a.setChecked(self.wwv_on and abs(mhz - f) < 1e-6)
+
+    def _on_wwv_minute(self, rec):
+        mhz = self.tune_hz / 1e6
+        self.decode_pane.append(wwv_line(rec, mhz), False)
+        self.wwv_win.add(rec, mhz)
+        car = rec["carrier"]
+        cs = "" if car is None else f", carrier {car['hz']:+.2f} Hz, SNR {car['snr']:+.1f} dB"
+        self.tx_label.setText(f"WWV {mhz:.3f} MHz: clock {wwv_ms(rec['clock_ms'])}{cs}")
+
+    def _onset_log_path(self):
+        return os.path.join(os.getcwd(), datetime.now().strftime("wwv_onsets_%Y%m%d_%H%M%S.csv"))
+
+    def set_onset_log(self, on):
+        self.onset_log_on = bool(on)
+        if self.wwv is not None:
+            if self.onset_log_on:
+                self.wwv.start_onset_log(self._onset_log_path())
+            else:
+                self.wwv.stop_onset_log()
+
+    def save_wwv_capture(self):
+        mon = self.wwv
+        events = list(mon.recent) if mon is not None else []
+        clock = self.wwv_win.recent[-1] if self.wwv_win.recent else None
+        return write_wwv_capture(self.ring, self.rate, self.tune_hz, events=events, clock_ms=clock)
+
+    def show_wwv_stats(self):
+        self.wwv_win.show()
+        self.wwv_win.raise_()
+        self.wwv_win.activateWindow()
 
     def _log_tx(self, r):
         self.decode_pane.append(tx_line(r, self.an.raw), False)
@@ -2113,6 +2853,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cur_slot = (slot_b, self._index_at(now, slot_b), self.cfg_version)
 
         rows_db, spec_db = self.an.process()
+        if self.wwv_on and self.wwv is not None:
+            for rec in self.wwv.process():
+                self._on_wwv_minute(rec)
         if self.an.skip_tx:
             self._update_tx_label()
             blk = int(time.time() // NOISE_REPORT_S)
