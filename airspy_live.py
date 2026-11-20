@@ -8,7 +8,8 @@ Decodes are appended to ALL.TXT in the current directory and shown in a pane at 
 bottom of the window, or in a separate window after "Pop out". CQ decodes are
 highlighted there and can be marked on the waterfall.
 
-A WWV timing mode logs the clock offset of the receiver and the carrier frequency.
+A WWV timing mode logs the clock offset of the receiver and the carrier frequency,
+and reads the WWV 100 Hz timecode to get date/time (if reception quality allows).
 
 -J.Beale N8JUF  19-Nov-2026
 
@@ -34,7 +35,7 @@ import threading
 import time
 import wave
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import scipy.fft as sfft
@@ -42,7 +43,7 @@ import scipy.signal as ssig
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.18.7"
+VERSION = "0.19.1"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -264,10 +265,8 @@ WWV_FREQS_MHZ = [("2.5 MHz", 2.5), ("5 MHz", 5.0), ("10 MHz", 10.0), ("15 MHz", 
 WWV_DEFAULT_MHZ = 10.0
 WWV_SPAN_KHZ = 3.0                           # display width centred on the carrier
 WWV_TONES_HZ = (1000.0, 1200.0, 1500.0)      # WWV seconds and minute, WWVH, WWV hour marker
-WWV_TONE_HALF_BW_HZ = 80.0
 WWV_DEC_RATE = 8000                          # envelope rate after decimation, S/s
 WWV_LP_HZ = 3500.0                           # envelope lowpass before decimation
-WWV_DETECT_DB = 15.0                         # tone onset: this far above the median envelope
 WWV_SEG_S = 3.0                              # analysis window, re-run every second
 WWV_EDGE_S = 0.75                            # a second is decided only when all its peaks lie this far
                                              # inside the window, so a tick's sidelobes are never split across passes
@@ -283,8 +282,6 @@ WWV_QUIET_SPAN_S = (0.6, 0.1)               # quiet span before a marker onset (
 WWV_MISS_SAVES_PER_HOUR = 6                 # cap on automatic envelope WAVs for minutes with no accepted marker
 WWV_MISS_SPAN_S = (3.0, 2.0)                # saved span around a missed minute: from 3 s before to 2 s after
 WWV_SHORT_S = 0.02                          # short tone window for the coverage test
-WWV_TICK_S = (0.002, 0.05)                   # 5 ms seconds ticks
-WWV_MARKER_S = (0.5, 1.2)                    # 800 ms minute and hour markers
 WWV_CARRIER_S = 10.0                         # carrier frequency and strength measured over this span
 WWV_CAPTURE_S = 10.0               # length of the raw IQ and envelope capture
 WWV_CARRIER_SEARCH_HZ = 3000.0
@@ -293,6 +290,181 @@ WWV_MAP_LAG_S = 1.0                          # ring samples map to wall time one
 WWV_HIST_S = 130.0                           # envelope history kept for the per-minute 100 Hz analysis
 WWV_FRAME_BAND_HZ = (90.0, 110.0)           # band of the 100 Hz time-code subcarrier in the envelope
 WWV_FRAME_EDGE_MS = 30.0                    # time-code pulses start 30 ms into the second (NIST SP 250-67)
+
+# WWV 100 Hz BCD time code. Layout follows NTP's WWV/H encoder (util/tg.c): one pulse per second,
+# a 1-minute frame, and no subcarrier in second 0. Each pulse starts WWV_FRAME_EDGE_MS into the
+# second and lasts 200 ms (binary 0), 500 ms (binary 1) or 800 ms (position identifier).
+TC_P_SECONDS = (9, 19, 29, 39, 49, 59)      # position identifiers
+TC_FIELDS = {                               # (second, weight), least significant bit first
+    "year_units": ((4, 1), (5, 2), (6, 4), (7, 8)),
+    "minute_units": ((10, 1), (11, 2), (12, 4), (13, 8)),
+    "minute_tens": ((15, 10), (16, 20), (17, 40)),
+    "hour_units": ((20, 1), (21, 2), (22, 4), (23, 8)),
+    "hour_tens": ((25, 10), (26, 20)),
+    "day_units": ((30, 1), (31, 2), (32, 4), (33, 8)),
+    "day_tens": ((35, 10), (36, 20), (37, 40), (38, 80)),
+    "day_hundreds": ((40, 100), (41, 200)),
+    "year_tens": ((51, 10), (52, 20), (53, 40), (54, 80)),
+}
+TC_MAX_INT_S = 2            # larger whole-second disagreement with the PC clock: frame rejected
+TC_NB = 100                 # 10 ms bins across the first second after each pulse-edge reference
+TC_TAIL_S = 0.85             # bins from here on carry no pulse: used for the noise level
+TC_BIN_S = 0.01
+TC_ON_S = {"0": 0.2, "1": 0.5, "P": 0.8}   # subcarrier on-time of each pulse, from the edge
+TC_SEARCH_MIN = 5          # candidate offset of the PC clock from true UTC, +/- whole minutes
+TC_HIST_MIN = 15           # minutes of time-code frames kept for the joint decode
+TC_MIN_MARGIN = 5.0       # log-likelihood margin (nats) the best offset needs over the next best
+
+
+def tc_window(hist, t_last, t0, t1, fs):
+    """Band-limited (90-110 Hz) envelope of the envelope history between wall times t0 and t1.
+    Returns (t_abs, env): wall time and envelope of each sample, or (None, None)."""
+    n = len(hist)
+    j0 = n - 1 - int(round((t_last - t0) * fs))
+    j1 = n - 1 - int(round((t_last - t1) * fs))
+    if n < 10 or j0 < 0 or j1 > n - 1 or j1 <= j0:
+        return None, None
+    seg = hist[j0:j1 + 1]
+    t_abs = t_last - (n - 1 - np.arange(j0, j1 + 1)) / fs
+    sos = ssig.butter(4, list(WWV_FRAME_BAND_HZ), btype="bandpass", fs=fs, output="sos")
+    bp = ssig.sosfiltfilt(sos, seg - float(np.mean(seg)))
+    return t_abs, np.abs(ssig.hilbert(bp))
+
+
+def tc_profiles(t_abs, env, delta, k0, count):
+    """Mean envelope in TC_NB bins of TC_BIN_S across the first second after each whole PC-clock
+    second k0..k0+count-1 (second boundaries at k + delta). Returns (count, TC_NB), or None if the
+    window does not cover every second."""
+    base = np.arange(k0, k0 + count, dtype=float) + delta
+    if base[0] < t_abs[0] or base[-1] + 1.0 > t_abs[-1]:
+        return None
+    cs = np.concatenate([[0.0], np.cumsum(env)])
+    edges = base[:, None] + np.arange(TC_NB + 1)[None, :] * TC_BIN_S
+    idx = np.searchsorted(t_abs, edges)
+    n = np.maximum(idx[:, 1:] - idx[:, :-1], 1)
+    return (cs[idx[:, 1:]] - cs[idx[:, :-1]]) / n
+
+
+def tc_template(on_s):
+    """Expected subcarrier shape across the bins for one pulse: 1 while the subcarrier is on."""
+    centre = (np.arange(TC_NB) + 0.5) * TC_BIN_S
+    edge = WWV_FRAME_EDGE_MS / 1000.0
+    return ((centre >= edge) & (centre < edge + on_s)).astype(float)
+
+
+TC_TEMPLATES = {c: tc_template(s) for c, s in TC_ON_S.items()}
+
+
+def tc_amp(prof, tmpl):
+    """Least-squares amplitude of a template in each profile row (level offset free)."""
+    g = tmpl - tmpl.mean()
+    p = prof - prof.mean(axis=1, keepdims=True)
+    return (p @ g) / float(g @ g)
+
+
+def tc_sse(prof, tmpl, amp):
+    """Residual sum of squares of each row for a template at a fixed amplitude (level offset free)."""
+    r = prof - amp * tmpl[None, :]
+    r = r - r.mean(axis=1, keepdims=True)
+    return (r * r).sum(axis=1)
+
+
+def tc_encode(epoch):
+    """The 60-character frame for the UTC minute starting at epoch: '-' second 0, 'P' position
+    identifiers, '0'/'1' elsewhere."""
+    t = datetime.fromtimestamp(epoch, timezone.utc)
+    yd = t.timetuple().tm_yday
+    word = ["-"] + ["0"] * 59
+    for p in TC_P_SECONDS:
+        word[p] = "P"
+    vals = {"minute_units": t.minute % 10, "minute_tens": (t.minute // 10) * 10,
+            "hour_units": t.hour % 10, "hour_tens": (t.hour // 10) * 10,
+            "day_units": yd % 10, "day_tens": ((yd // 10) % 10) * 10,
+            "day_hundreds": (yd // 100) * 100,
+            "year_units": t.year % 10, "year_tens": ((t.year // 10) % 10) * 10}
+    for name, v in vals.items():
+        for pos, w in sorted(TC_FIELDS[name], key=lambda x: -x[1]):
+            if v >= w:
+                word[pos] = "1"
+                v -= w
+    return "".join(word)
+
+
+def tc_costs(rows, amp):
+    """Cost of each symbol for each second's profile, columns '-', '0', '1', 'P' (scaled by
+    2 x noise variance). A pulse-type symbol costs no more than leaving the second with no pulse,
+    so a dropped pulse does not count against any candidate frame."""
+    flat = tc_sse(rows, np.zeros(TC_NB), amp)
+    cols = [flat] + [np.minimum(tc_sse(rows, TC_TEMPLATES[c], amp), flat) for c in "01P"]
+    return np.stack(cols, axis=1)
+
+
+def tc_solve(entries, search_min):
+    """Joint time-code decode over several minutes. entries: (P, k0, delta, prof) per frame, where P
+    is the PC-clock minute index of the frame's window, k0 its first PC second and prof its profiles.
+    The true minute of entry P is P + d for one integer d, and the frame start within each window
+    is one shared alignment s, because the PC clock's whole-second error is the same in every
+    minute. Each (d, s) is scored by the summed likelihood of all entries. Returns the result dict
+    for the newest entry."""
+    SYM = {"-": 0, "0": 1, "1": 2, "P": 3}
+    tail = int(round(TC_TAIL_S / TC_BIN_S))
+    opts = []
+    for P, k0, delta, prof in entries:
+        # one noise variance per window, from bins after the last possible pulse, so that
+        # alignments and candidate words are compared on the same scale
+        sig2 = float(np.median(prof[:, tail:].var(axis=1)))
+        per = {}
+        if sig2 > 0:
+            for s in range(prof.shape[0] - 59):
+                rows = prof[s:s + 60]
+                # keep every alignment: a weak or negative P median in one window must not
+                # veto that alignment for all minutes; a floored amplitude makes it erased
+                amp = max(float(np.median(tc_amp(rows[list(TC_P_SECONDS)], TC_TEMPLATES["P"]))), 1e-9)
+                per[s] = (tc_costs(rows, amp), 2.0 * sig2)
+        opts.append(per)
+    if not all(opts):
+        return {"time": None, "ok": False, "clock_ms": None, "bits": "", "conf": "",
+                "reason": "no usable frame in the joint window"}
+    common = set.intersection(*(set(o) for o in opts))
+    if not common:
+        return {"time": None, "ok": False, "clock_ms": None, "bits": "", "conf": "",
+                "reason": "no alignment common to all minutes"}
+
+    totals = {}
+    for d in range(-search_min, search_min + 1):
+        words = [np.array([SYM[c] for c in tc_encode((P + d) * 60)])
+                 for P, _, _, _ in entries]
+        for s in common:
+            total = 0.0
+            for idx, per in zip(words, opts):
+                cost, two_nv = per[s]
+                total += -float(cost[np.arange(60), idx].sum()) / two_nv
+            totals[(d, s)] = total
+    d_best, s_best = max(totals, key=totals.get)
+    margin = totals[(d_best, s_best)] - max(v for (d, _), v in totals.items() if d != d_best)
+
+    P, k0, delta, prof = entries[-1]
+    E_last = (P + d_best) * 60
+    word = tc_encode(E_last)
+    idx = np.array([SYM[c] for c in word])
+    cost, two_nv = opts[-1][s_best]
+    conf = []
+    for j in range(60):
+        e = idx[j]
+        other = min(cost[j, k] for k in range(4) if k != e)
+        conf.append(str(max(0, min(9, int((other - cost[j, e]) / two_nv)))))
+    whole = (k0 + s_best) - E_last
+    ok = abs(whole) <= TC_MAX_INT_S and margin >= TC_MIN_MARGIN
+    if ok:
+        reason = f"ok, {len(entries)} minutes, offset {d_best:+d} min, margin {margin:.1f} nats"
+    elif margin < TC_MIN_MARGIN:
+        reason = f"not yet unique, margin {margin:.1f} nats over {len(entries)} minutes"
+    else:
+        reason = f"whole second differs from PC clock by {whole} s"
+    start_t = datetime.fromtimestamp(E_last, timezone.utc)
+    return {"time": start_t.strftime("%Y-%m-%d %H:%M"), "ok": ok,
+            "clock_ms": (whole + delta) * 1000.0 if ok else None,
+            "bits": word, "conf": "".join(conf), "reason": reason}
 
 
 def tx_line(r, raw):
@@ -527,7 +699,10 @@ def wwv_line(rec, mhz):
     tone = "--" if rec["tone_db"] is None else f"{rec['tone_db']:.1f} dB"
     return (f"{stamp} UTC  WWV {mhz:.3f} MHz  clock {wwv_ms(rec['clock_ms'])} ({rec['n']} marks)  "
             f"marker {wwv_ms(rec['marker_ms'])}  {cs}  tone peak/median {tone}  "
-            f"tones {wwv_tones(rec)}")
+            f"tones {wwv_tones(rec)}  time code {rec.get('tc_time') or '--'}  "
+            f"clock offset {wwv_ms(rec.get('clock_full_ms'))}  "
+            f"tc {rec.get('tc_bits') or '--'} conf {rec.get('tc_conf') or '--'} "
+            f"[{rec.get('tc_reason') or ''}]")
 
 
 class WwvMonitor:
@@ -558,7 +733,8 @@ class WwvMonitor:
                                       "tick_ms", "marker_ms", "frame100_ms", "frame100_contrast",
                                       "carrier_hz", "carrier_ppm", "carrier_snr_db", "tone_db",
                                       "tones", "nominal_hz", "marker_1k_n", "marker_cov",
-                                      "marker_quiet", "marker_db"])
+                                      "marker_quiet", "marker_db",
+                                      "tc_time", "tc_ok", "clock_full_ms", "tc_bits", "tc_conf", "tc_reason"])
         self.reset()
 
     def start_onset_log(self, path):
@@ -601,6 +777,7 @@ class WwvMonitor:
         self.recent_markers = deque(maxlen=20)   # recently accepted markers, for plateau removal
         self.marker_diag = []                    # every 1 kHz marker candidate seen, before the gates
         self.miss_saves = deque(maxlen=200)      # wall times of automatic miss captures
+        self.tc_hist = deque(maxlen=TC_HIST_MIN) # time-code frames for the joint decode
 
     def set_nominal(self, hz):
         self.nominal_hz = hz
@@ -644,6 +821,11 @@ class WwvMonitor:
         if len(self.env) >= seg_n and self.env_end >= self.next_seg:
             self.next_seg = self.env_end + int(self.fs)
             self._analyse(total, now)
+        # newest UTC minute that has ended WWV_SETTLE_S ago; if the loop stalled and fell behind,
+        # jump to it so the row label always names the minute that just ended
+        newest_done = int((now - WWV_SETTLE_S) // 60) - 1
+        if self.minute < newest_done:
+            self.minute = newest_done
         if now >= (self.minute + 1) * 60 + WWV_SETTLE_S:
             rec = self._finish_minute(self.minute, total, now)
             self._log_minute(rec)
@@ -814,7 +996,10 @@ class WwvMonitor:
             "" if car is None else f"{car['snr']:+.1f}",
             "" if rec["tone_db"] is None else f"{rec['tone_db']:.1f}",
             wwv_tones(rec), int(self.nominal_hz), rec["marker_1k_n"],
-            _opt(rec["marker_cov"], 2), _opt(rec["marker_quiet"], 2), _opt(rec["marker_db"], 1)])
+            _opt(rec["marker_cov"], 2), _opt(rec["marker_quiet"], 2), _opt(rec["marker_db"], 1),
+            rec.get("tc_time") or "", "" if rec.get("tc_ok") is None else int(rec["tc_ok"]),
+            f(rec.get("clock_full_ms")), rec.get("tc_bits") or "", rec.get("tc_conf") or "",
+            rec.get("tc_reason") or ""])
         self.minute_file.flush()
 
     def _save_marker_miss(self, rec, total, now):
@@ -861,6 +1046,31 @@ class WwvMonitor:
             json.dump(info, f, indent=2)
         self.miss_saves.append(now)
         return wav_path, json_path
+
+    def _timecode(self, M, total, now, frame100_ms):
+        """Decode the 100 Hz time-code frame that starts in UTC minute M and solve jointly with the
+        frames of the previous minutes. The frame ends one second into minute M+1, so it is complete
+        when minute M is reported. Always returns a dict as tc_solve does."""
+        def fail(reason):
+            return {"time": None, "ok": False, "clock_ms": None, "bits": "", "conf": "",
+                    "reason": reason}
+
+        if frame100_ms is None:
+            return fail("no 100 Hz edge measured")
+        T0 = M * 60 - 1.0                        # frame start considered (one second before the minute)
+        # _wall() adds WWV_MAP_LAG_S for the tone markers; the time code must use true PC time,
+        # or every frame is read one second late and the full clock gains a whole second
+        t_last = self._wall(self.env_end - 1, total, now) - WWV_MAP_LAG_S
+        t_abs, env = tc_window(self.hist, t_last, T0 - 1.0, T0 + 63.0, self.fs)
+        if t_abs is None:
+            return fail("envelope history too short")
+        delta = frame100_ms / 1000.0
+        k0 = int(math.ceil(T0))
+        prof = tc_profiles(t_abs, env, delta, k0, 62)
+        if prof is None:
+            return fail("window does not cover the frame")
+        self.tc_hist.append((M, k0, delta, prof))
+        return tc_solve(list(self.tc_hist), TC_SEARCH_MIN)
 
     def _carrier(self, total):
         """Carrier offset from the nominal frequency (Hz, ppm) and its SNR in a 4 Hz band."""
@@ -910,6 +1120,13 @@ class WwvMonitor:
         rec["marker_quiet"] = best["quiet"] if best else None
         rec["marker_db"] = best["db"] if best else None
         rec["frame100_ms"], rec["frame100_contrast"] = self._frame100(M, total, now)
+        tc = self._timecode(M, total, now, rec["frame100_ms"])
+        rec["tc_time"] = tc["time"]
+        rec["tc_ok"] = tc["ok"]
+        rec["clock_full_ms"] = tc["clock_ms"]
+        rec["tc_bits"] = tc["bits"]
+        rec["tc_reason"] = tc["reason"]
+        rec["tc_conf"] = tc["conf"]
         self.tone_db = None
         return rec
 
@@ -1502,9 +1719,10 @@ def write_wwv_capture(ring, rate, tune_hz, seconds=WWV_CAPTURE_S, outdir=None,
 class WwvStatsWindow(QtWidgets.QWidget):
     """WWV timing: one row per UTC minute, newest first. Updated as each minute completes."""
 
-    COLUMNS = ["UTC", "Clock (ms)", "Marks", "Tick med (ms)", "Marker (ms)", "100 Hz edge (ms)",
+    COLUMNS = ["UTC", "Clock offset (ms)", "Marks", "Tick med (ms)", "Marker (ms)", "100 Hz edge (ms)",
                "100 Hz contrast", "Carrier (Hz)",
-               "Carrier (ppm)", "Carrier SNR (dB)", "Tone (dB)", "Tones"]
+               "Carrier (ppm)", "Carrier SNR (dB)", "Tone (dB)", "Tones",
+               "Time code (UTC)"]
     MAX_ROWS = 1440
 
     def __init__(self, capture_fn=None, onset_log_fn=None):
@@ -1513,7 +1731,7 @@ class WwvStatsWindow(QtWidgets.QWidget):
         self.onset_log_fn = onset_log_fn
         self.setWindowTitle("WWV timing")
         self.resize(1040, 480)
-        self.recent = deque(maxlen=10)           # clock offsets of the latest minutes
+        self.recent = deque(maxlen=10)           # clock offsets (ms) of the latest minutes
         self.summary = QtWidgets.QLabel("No minutes yet")
         self.table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
@@ -1548,7 +1766,7 @@ class WwvStatsWindow(QtWidgets.QWidget):
         car = rec["carrier"]
         vals = [
             time.strftime("%H:%M", time.gmtime(rec["wall"])),
-            wwv_ms(rec["clock_ms"]),
+            wwv_ms(rec.get("clock_full_ms")),
             str(rec["n"]),
             wwv_ms(rec["tick_ms"]),
             wwv_ms(rec["marker_ms"]),
@@ -1559,20 +1777,21 @@ class WwvStatsWindow(QtWidgets.QWidget):
             "--" if car is None else f"{car['snr']:+.1f}",
             "--" if rec["tone_db"] is None else f"{rec['tone_db']:.1f}",
             wwv_tones(rec),
+            rec.get("tc_time") or "--",
         ]
         self.table.insertRow(0)
         for col, v in enumerate(vals):
             self.table.setItem(0, col, QtWidgets.QTableWidgetItem(v))
         while self.table.rowCount() > self.MAX_ROWS:
             self.table.removeRow(self.table.rowCount() - 1)
-        if rec["clock_ms"] is not None:
-            self.recent.append(rec["clock_ms"])
+        if rec.get("clock_full_ms") is not None:
+            self.recent.append(rec["clock_full_ms"])
         if self.recent:
             r = list(self.recent)
             cs = ("" if car is None else
                   f"   Carrier {car['hz']:+.2f} Hz ({car['ppm']:+.3f} ppm), SNR {car['snr']:+.1f} dB")
             self.summary.setText(
-                f"{mhz:.3f} MHz   Clock last {r[-1]:+.1f} ms, median of last {len(r)} min "
+                f"{mhz:.3f} MHz   Clock offset last {r[-1]:+.1f} ms, median of last {len(r)} min "
                 f"{float(np.median(r)):+.1f} ms, range {min(r):+.1f} to {max(r):+.1f} ms{cs}")
 
 
@@ -3037,3 +3256,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
