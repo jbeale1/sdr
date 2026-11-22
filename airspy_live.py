@@ -5,13 +5,13 @@
 Requires: numpy, scipy, PySide6, pyqtgraph, libairspyhf, and jt9 on PATH.
 Decoder WAV files are written to /dev/shm and deleted after each decode.
 Decodes are appended to ALL.TXT in the current directory and shown in a pane at the
-bottom of the window, or in a separate window after "Pop out". CQ decodes are
-highlighted there and can be marked on the waterfall.
+bottom of the window, or in a separate window after "Pop out". 
 
 A WWV timing mode logs the clock offset of the receiver and the carrier frequency,
 and reads the WWV 100 Hz timecode to get date/time (if reception quality allows).
+There is also a morse decode mode (not above 22 wpm though).
 
--J.Beale N8JUF  19-Nov-2026
+-J.Beale N8JUF  22-Nov-2026
 
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
@@ -43,7 +43,7 @@ import scipy.signal as ssig
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.19.1"
+VERSION = "0.20.0"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -69,7 +69,7 @@ COUNT_STRIP_W = 34              # width of the decode-count strip beside the wat
 COUNT_AXIS_H = 50               # height of the top and bottom axes of the waterfall column, px
 
 SPAN_PRESETS = [
-    ("500 Hz", 0.5),
+    ("1 kHz", 1.0),
     ("3 kHz", 3.0),
     ("6 kHz", 6.0),
     ("12 kHz", 12.0),
@@ -508,6 +508,7 @@ class TxDetector:
         self.reset_events()
 
     def _smooth(self, arr, n):
+        n = min(n, len(arr))         # np.convolve 'same' returns the longer input's length
         return np.convolve(arr, np.ones(n) / n, mode="same")
 
     def _reset_noise(self):
@@ -646,7 +647,7 @@ class TxDetector:
             return None, self.center, None, None
         mean = self.tx_lin / self.tx_n
         dk = float(np.median(np.diff(self.freq_khz)))
-        n = max(1, int(round(TX_SMOOTH_KHZ / dk)))
+        n = max(1, min(int(round(TX_SMOOTH_KHZ / dk)), len(mean)))
         spec = 10 * np.log10(np.convolve(mean, np.ones(n) / n, mode="same") + 1e-30)
         p = int(np.argmax(np.where(self.mask, spec, -np.inf)))
         level = spec[p] - TX_BW_DB
@@ -673,6 +674,240 @@ class TxDetector:
                      "snr": snr,
                      "dur": self.last_above - self.cand}
         self.new_result = self.last
+
+
+# ---- CW decoder: Morse on/off keying of the strongest carrier in the display window ----
+
+CW_SPAN_KHZ = 3.0               # display width when CW mode is entered, centred on the tuning
+CW_N = 2048                     # FFT size for the carrier search and the band power
+CW_HOP_S = 0.005                # one band-power sample every 5 ms
+CW_AVG_S = 0.5                  # averaging time of the spectrum used to find the carrier (tracks drift)
+CW_BAND_HALF_HZ = 150.0         # carrier power is summed over this half-width (signal is about 100 Hz wide)
+CW_SMOOTH_FRAMES = 3            # frames averaged in linear power before the level is measured
+CW_RESEL_FRAMES = 5             # how often the carrier bin is re-chosen (5 frames = 25 ms)
+CW_MIN_SEP_DB = 6.0            # threshold is never closer than half this above the key-up level
+CW_HYST_DB = 1.5                # hysteresis around the key threshold
+CW_HIST_S = 30.0                # key-up level history (noise floor)
+CW_LEVEL_S = 3.0               # recent level history (key-down level), so each transmission sets its own threshold
+CW_QUEUE_S = 5.0                # frames kept until a threshold exists
+CW_TX_END_S = 2.5               # this much key-up ends a transmission
+CW_MIN_ON_S = 0.035             # shorter key-down blips are treated as noise (dit at 22 wpm is 55 ms)
+CW_WPM_MIN = 8.0
+CW_WPM_MAX = 22.0
+CW_MIN_CHARS = 3                # a transmission needs this many recognised characters to be logged
+CW_CODE = {
+    "A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".", "F": "..-.", "G": "--.",
+    "H": "....", "I": "..", "J": ".---", "K": "-.-", "L": ".-..", "M": "--", "N": "-.",
+    "O": "---", "P": ".--.", "Q": "--.-", "R": ".-.", "S": "...", "T": "-", "U": "..-",
+    "V": "...-", "W": ".--", "X": "-..-", "Y": "-.--", "Z": "--..",
+    "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-", "5": ".....",
+    "6": "-....", "7": "--...", "8": "---..", "9": "----.",
+    ".": ".-.-.-", ",": "--..--", "?": "..--..", "/": "-..-.", "=": "-...-",
+}
+CW_TEXT = {code: ch for ch, code in CW_CODE.items()}
+
+
+def cw_estimate_unit(ons, offs):
+    """Dit length in seconds that best fits the key-down durations (1 or 3 dits) and the key-up
+    durations (1, 3 or 7 dits), searched over CW_WPM_MIN to CW_WPM_MAX."""
+    on = np.asarray(ons, dtype=np.float64)
+    off = np.asarray(offs, dtype=np.float64)
+    best_e, best_u = np.inf, None
+    for wpm in np.arange(CW_WPM_MIN, CW_WPM_MAX + 1e-9, 0.1):
+        u = 1.2 / wpm
+        e = float(np.min([np.log(on / u) ** 2, np.log(on / (3 * u)) ** 2], axis=0).sum())
+        if off.size:
+            e += float(np.min([np.log(off / u) ** 2, np.log(off / (3 * u)) ** 2,
+                               np.log(off / (7 * u)) ** 2], axis=0).sum())
+        if e < best_e:
+            best_e, best_u = e, u
+    return best_u
+
+
+def cw_decode(segs, unit):
+    """segs: [is_key_down, seconds] in time order. Returns (text, recognised character count).
+    A dit is under 2 units and a dah is over. Key-up under 2 units stays within a character,
+    2 to 5 units ends a character, 5 units or more is a word space. Unknown codes show as #."""
+    out, sym = [], ""
+    for on, d in segs:
+        if on:
+            sym += "." if d < 2 * unit else "-"
+            continue
+        if d < 2 * unit:
+            continue
+        if sym:
+            out.append(CW_TEXT.get(sym, "#"))
+            sym = ""
+        if d >= 5 * unit:
+            out.append(" ")
+    if sym:
+        out.append(CW_TEXT.get(sym, "#"))
+    text = " ".join("".join(out).split())
+    return text, sum(1 for c in text if c not in " #")
+
+
+def cw_line(rec):
+    stamp = time.strftime("%H:%M:%S", time.gmtime(rec["wall"]))
+    return (f"{stamp} UTC  {rec['mhz']:.4f} MHz  CW {rec['wpm']:.1f} wpm  {rec['text']}  "
+            f"raw {rec['raw']:+.1f} dB  SNR {rec['snr']:+.1f} dB  {rec['dur']:.1f} s")
+
+
+class CwDecoder:
+    """CW decoder for the strongest on/off-keyed carrier in a display window. Band power around
+    the carrier is sampled every CW_HOP_S. Key-down runs are grouped into transmissions, and each
+    transmission is decoded when it ends. Raw level is the mean key-down band power in dB
+    (uncalibrated); SNR is that above the key-up level."""
+
+    def __init__(self, ring, rate):
+        self.ring = ring
+        self.rate = rate
+        self.hop = max(1, int(round(CW_HOP_S * rate)))
+        self.win = np.hanning(CW_N).astype(np.float32)
+        self.wnorm = float(np.sum(self.win.astype(np.float64) ** 2))
+        self.freqs = np.fft.fftshift(np.fft.fftfreq(CW_N, 1.0 / rate))
+        self.a_avg = self.hop / (CW_AVG_S * rate)
+        self.hist_len = int(CW_HIST_S * rate / self.hop)
+        self.recent_len = int(CW_LEVEL_S * rate / self.hop)
+        self.queue_len = int(CW_QUEUE_S * rate / self.hop)
+        self.win_mask = np.ones(CW_N, dtype=bool)
+        self.tune_hz = 0
+        self.reset()
+
+    def set_window(self, tune_hz, lo_off, hi_off):
+        """Search window in Hz offsets from tuning. Any change restarts the decoder."""
+        self.tune_hz = int(tune_hz)
+        self.win_mask = (self.freqs >= lo_off) & (self.freqs <= hi_off)
+        self.reset()
+
+    def reset(self):
+        self.pos = None                                  # next ring sample to read
+        self.avg = None                                  # time-averaged power, for the carrier search
+        self.frame_n = 0
+        self.fc = None                                   # carrier offset from tuning, Hz
+        self.band = None                                 # bins summed for the carrier power
+        self.hist = deque(maxlen=self.hist_len)          # band level, dB, for the noise floor
+        self.recent = deque(maxlen=self.recent_len)      # band level, dB, for the key-down level
+        self.sm = deque(maxlen=CW_SMOOTH_FRAMES)         # recent band powers, for smoothing
+        self.queue = deque(maxlen=self.queue_len)        # (centre sample, level) awaiting decisions
+        self.thr = None                                  # key-down threshold, dB (None until keying is seen)
+        self.noise_db = None                             # key-up level, dB
+        self.run_on = False                              # state of the run being accumulated
+        self.run_n = 0
+        self.run_t0 = 0
+        self.run_pow = 0.0
+        self.closed = []                                 # finished runs since the last transmission
+
+    def process(self, now=None):
+        """Measure new frames and return the transmissions that ended since the last call."""
+        ring, hop = self.ring, self.hop
+        total = ring.total
+        now = time.time() if now is None else now
+        if total < CW_N:
+            return []
+        if self.pos is None or total - self.pos > ring.size - CW_N:
+            self.pos = total - CW_N
+        avail = total - self.pos
+        if avail < CW_N:
+            return []
+        k = min((avail - CW_N) // hop + 1, 200)
+        seg = ring.read(self.pos, (k - 1) * hop + CW_N)
+        if seg is None:
+            self.pos = None
+            return []
+        base = self.pos
+        self.pos += k * hop
+        frames = np.lib.stride_tricks.sliding_window_view(seg, CW_N)[::hop] * self.win
+        X = np.fft.fftshift(np.fft.fft(frames, axis=1), axes=1)
+        P = X.real * X.real + X.imag * X.imag
+        for i in range(k):
+            self._frame(P[i], base + i * hop + CW_N // 2)
+        return self._drain(total, now)
+
+    def _frame(self, Pi, center):
+        self.frame_n += 1
+        if self.avg is None:
+            self.avg = Pi.astype(np.float64)
+        else:
+            self.avg += self.a_avg * (Pi - self.avg)
+        if self.fc is None or self.frame_n % CW_RESEL_FRAMES == 0:   # a carrier that appears is picked up within a few frames
+            idx = int(np.argmax(np.where(self.win_mask, self.avg, -np.inf)))
+            self.fc = float(self.freqs[idx])
+            self.band = np.flatnonzero(np.abs(self.freqs - self.fc) <= CW_BAND_HALF_HZ)
+        self.sm.append(float(np.sum(Pi[self.band])) / self.wnorm)
+        env = sum(self.sm) / len(self.sm)
+        lev = 10.0 * math.log10(env + 1e-30)
+        self.hist.append(lev)
+        self.recent.append(lev)
+        if self.frame_n % 20 == 0 and len(self.hist) >= 200:
+            lo = float(np.percentile(np.asarray(self.hist), 10))
+            hi = float(np.percentile(np.asarray(self.recent), 90))
+            self.noise_db = lo
+            self.thr = lo + 0.5 * max(hi - lo, 2.0 * CW_MIN_SEP_DB)
+        self.queue.append((center, env))
+
+    def _drain(self, total, now):
+        """Decide key-down or key-up for queued frames once a threshold exists. Returns finished
+        transmissions. Frames queued before the threshold are decided retroactively."""
+        out = []
+        while self.thr is not None and self.queue:
+            center, env = self.queue.popleft()
+            env_db = 10.0 * math.log10(env + 1e-30)
+            on = self.run_on
+            if on and env_db < self.thr - CW_HYST_DB:
+                on = False
+            elif not on and env_db > self.thr + CW_HYST_DB:
+                on = True
+            if on != self.run_on:
+                if self.run_n:
+                    self.closed.append((self.run_on, self.run_n, self.run_t0, self.run_pow))
+                self.run_on, self.run_n, self.run_pow = on, 0, 0.0
+            if self.run_n == 0:
+                self.run_t0 = center
+            self.run_n += 1
+            self.run_pow += env
+            if not self.run_on and self.run_n * self.hop / self.rate >= CW_TX_END_S:
+                if any(r[0] for r in self.closed):
+                    rec = self._finish(total, now)
+                    if rec is not None:
+                        out.append(rec)
+                self.closed = []
+        return out
+
+    def _finish(self, total, now):
+        segs, on_pow, on_n, t_first = [], 0.0, 0, None
+        for on, n, t0, pw in self.closed:
+            d = n * self.hop / self.rate
+            if on and d < CW_MIN_ON_S:
+                on = False                               # too short to be an element
+            if on:
+                on_pow += pw
+                on_n += n
+                if t_first is None:
+                    t_first = t0
+            if segs and segs[-1][0] == on:
+                segs[-1][1] += d
+            else:
+                segs.append([on, d])
+        while segs and not segs[0][0]:
+            segs.pop(0)
+        while segs and not segs[-1][0]:
+            segs.pop()
+        ons = [d for on, d in segs if on]
+        if not ons or t_first is None:
+            return None
+        offs = [d for on, d in segs if not on]
+        unit = cw_estimate_unit(ons, offs)
+        text, n_chars = cw_decode(segs, unit)
+        if n_chars < CW_MIN_CHARS:
+            return None
+        raw = 10.0 * math.log10(on_pow / on_n + 1e-30)
+        return {"wall": now - (total - t_first) / self.rate,
+                "mhz": (self.tune_hz + self.fc) / 1e6,
+                "wpm": 1.2 / unit,
+                "text": text,
+                "raw": raw,
+                "snr": raw - self.noise_db,
+                "dur": sum(d for _, d in segs)}
 
 
 # ------------------------------------------------------------ WWV timing
@@ -1163,6 +1398,13 @@ class Analyzer:
     def set_avg(self, on):
         """Time-average the waterfall over avg_s seconds, or show each row's own power."""
         self.alpha = min(1.0, self.row_s / max(self.avg_s, self.row_s)) if on else 1.0
+
+    def restart_average(self):
+        """Make the 15 s average equal the current live trace and restart averaging from it."""
+        if self.ema is None:
+            return
+        self.ema_long = self.ema.copy()
+        self.spec_avg_db = 10 * np.log10(self.ema_long + 1e-20) - (0.0 if self.raw else self.bg)
 
     def configure(self, tune_hz, lo_off, hi_off, settle_s=0.0):
         """Set the displayed bins (offsets from tuning, Hz) and reset averaging."""
@@ -1939,6 +2181,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.manual_tuned = False       # True once the user has retuned or changed the span
         self.wwv_on = False             # WWV timing mode: tuned to a WWV frequency, decoding off
         self.wwv = None                 # WwvMonitor while wwv_on
+        self.cw_on = False              # CW decode mode: 3 kHz window, Morse decoding on
+        self.cw = None                  # CwDecoder while cw_on
+        self.cw_txt = os.path.join(os.path.dirname(os.path.abspath(all_txt)), "CW.TXT")
         self.onset_log_on = False       # write the onset CSV (debugging); set from the WWV window
         self.wwv_mhz = WWV_DEFAULT_MHZ  # WWV frequency last chosen from the menu
 
@@ -2013,7 +2258,7 @@ class MainWindow(QtWidgets.QMainWindow):
             0.0, 1.0, 256, alpha=True, mode="byte")          # (256, 4) uint8
 
         # --- controls row
-        self.btn_save = QtWidgets.QPushButton("Save PNG")
+        self.btn_save = QtWidgets.QPushButton("Save  ▾")
         self.btn_popout = QtWidgets.QPushButton("Pop out")
         self.btn_marks = QtWidgets.QPushButton("Mark")
         self.btn_marks.setCheckable(True)
@@ -2026,7 +2271,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # mode menu: FT8, FT4, Off, and a WWV submenu (frequencies, timing window, capture)
         self.mode_menu = QtWidgets.QMenu(self)
         self.mode_actions = {}
-        for name in ("FT8", "FT4", "Off"):
+        for name in ("FT8", "FT4", "CW", "Off"):
             a = self.mode_menu.addAction(name)
             a.setCheckable(True)
             a.triggered.connect(lambda _=False, n=name: self._on_mode_action(n))
@@ -2102,7 +2347,13 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(self.btn_exit)
 
         self.span_box.currentIndexChanged.connect(self.on_span)
-        self.btn_save.clicked.connect(self.save_png)
+        self.save_menu = QtWidgets.QMenu(self)
+        self.save_menu.addAction("Save PNG image").triggered.connect(self.save_png)
+        self.save_menu.addAction("Save blue trace as CSV").triggered.connect(self.save_trace_csv)
+        self.btn_save.setMenu(self.save_menu)
+        self.btn_save.setToolTip("Save PNG image (Ctrl+S) or the blue trace as CSV")
+        self.save_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self)
+        self.save_shortcut.activated.connect(self.save_png)
         self.btn_popout.clicked.connect(self.pop_out)
         self.btn_exit.clicked.connect(self.exit_app)
         self.btn_marks.toggled.connect(self._set_marks_visible)
@@ -2243,11 +2494,18 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.quit()
 
     # ---- decodes pane: pop out / dock back
+    def _bar_controls(self):
+        """Buttons of the decodes top bar other than Pop out, in display order."""
+        pane = self.decode_pane
+        return [pane.btn_stats, pane.btn_split, self.btn_clear_log,
+                self.chk_noise, self.btn_ref_reset, self.btn_check_noise]
+
     def pop_out(self):
         if not self.popped:
             self.popout.lay.addWidget(self.decode_pane)        # moves the whole decodes window
-            self.popout.top.insertWidget(1, self.decode_pane.btn_stats)   # left of Single pane / Two panes
-            self.popout.top.insertWidget(2, self.decode_pane.btn_split)   # left of Dock
+            # the top bar is hidden below, so every button in it moves to the popout's bar
+            for i, w in enumerate(self._bar_controls()):
+                self.popout.top.insertWidget(1 + i, w)         # after the stretch, before Dock
             self.decode_pane.top_bar.hide()
             self.popped = True
             self.decode_dock.hide()
@@ -2259,9 +2517,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.popped:
             return
         self.decode_dock.setWidget(self.decode_pane)                 # moves the decodes window back
-        # keep the order: Stats, Two panes, Pop out (the Pop out button stayed in the bar)
-        self.decode_pane.top_bar.layout().insertWidget(1, self.decode_pane.btn_stats)
-        self.decode_pane.top_bar.layout().insertWidget(2, self.decode_pane.btn_split)
+        # restore the bar: Stats, Two panes, Pop out (it never left the bar), then the rest
+        bar = self.decode_pane.top_bar.layout()
+        bar.insertWidget(1, self.decode_pane.btn_stats)
+        bar.insertWidget(2, self.decode_pane.btn_split)
+        for i, w in enumerate(self._bar_controls()[2:]):
+            bar.insertWidget(4 + i, w)
         self.decode_pane.top_bar.show()
         self.popped = False
         self.popout.hide()
@@ -2294,6 +2555,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.f0 = float(self.an.freq_khz[0])
         self.f1 = float(self.an.freq_khz[-1])
         self.spec_y = None
+        if self.cw is not None:
+            self.cw.set_window(self.tune_hz, lo, hi)
 
     def _refresh(self):
         self.off_axis.tune_hz = float(self.tune_hz)     # audio offset is measured from the dial
@@ -2336,9 +2599,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- decode mode: FT8, FT4, WWV or off (one at a time)
     def _on_mode_action(self, name):
-        mode = None if name == "Off" else name
         if self.wwv_on:
             self._leave_wwv()
+        if name == "CW":
+            self._enter_cw()
+            return
+        mode = None if name == "Off" else name
+        if self.cw_on:
+            self._leave_cw()
         if mode is not None and self.an.skip_tx:
             self.blue_box.setCurrentIndex(self.blue_box.findData("peak"))
         if mode != self.mode:
@@ -2472,6 +2740,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.an.tx.reset_events()
         if self.wwv_on:
             self._leave_wwv()
+        if self.cw_on:
+            self._leave_cw()
         self._set_mode(None)                    # Tx Test, WWV and FT8/FT4 are mutually exclusive
         self._select_mode_box("Off")
         self.decode_dock.setWindowTitle("Tx log")
@@ -2491,8 +2761,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_check_noise.setVisible(False)
         self.decode_dock.setWindowTitle("Decodes")
 
+    # ---- CW mode: Morse decoder on the strongest keyed carrier in a 3 kHz window
+    def _enter_cw(self):
+        if self.an.skip_tx:
+            self.blue_box.setCurrentIndex(self.blue_box.findData("peak"))
+        self._set_mode(None)
+        self.cw_on = True
+        self.cw = CwDecoder(self.ring, self.rate)
+        self.decode_dock.setWindowTitle("CW decodes")
+        self.popout.setWindowTitle("CW decodes")
+        self._select_mode_box("CW")
+        khz = self.tune_hz / 1e3
+        self._tune_window(self.tune_hz / 1e6, khz - CW_SPAN_KHZ / 2, khz + CW_SPAN_KHZ / 2)
+        self.cw.set_window(self.tune_hz, self.disp_off - self.span_hz / 2,
+                           self.disp_off + self.span_hz / 2)
+        self.rate_label.setText("")
+        self.tx_label.setText("CW: listening")
+
+    def _leave_cw(self):
+        self.cw_on = False
+        self.cw = None
+        self.tx_label.setText("")
+        self.decode_dock.setWindowTitle("Decodes")
+        self.popout.setWindowTitle("Decodes")
+        self._update_rate()
+
+    def _on_cw(self, rec):
+        line = cw_line(rec)
+        self.decode_pane.append(line, False)
+        self.tx_label.setText(f"CW {rec['mhz']:.4f} MHz: {rec['text']}")
+        try:
+            with open(self.cw_txt, "a") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            self.tx_label.setText(f"CW.TXT write failed: {e}")
+
     # ---- WWV timing mode: tuned to a WWV frequency with decoding off; separate from Tx Test
     def _enter_wwv(self, mhz):
+        if self.cw_on:
+            self._leave_cw()
         if self.an.skip_tx:
             self.blue_box.setCurrentIndex(self.blue_box.findData("peak"))
         self._set_mode(None)
@@ -2604,7 +2911,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.msg.setText("airspyhf_start() failed")
 
     def _reset_peak(self):
-        self.an.peak_db = None
+        if self.blue_mode == "avg":
+            # restart the 15 s average from the live trace, shown at once even if paused
+            self.an.restart_average()
+            if self.an.spec_avg_db is not None:
+                self.spec_avg_curve.setData(self.an.freq_khz, self.an.spec_avg_db)
+        else:
+            self.an.peak_db = None
 
     def _fit_spec_y(self, spec_db, blue):
         """Raw power: fit the spectrum axis to the traces. The floor is 5 dB below the 5th percentile
@@ -2647,10 +2960,36 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def save_png(self):
         path = os.path.join(os.getcwd(), datetime.now().strftime("airspy_%Y%m%d_%H%M%S.png"))
-        if self.grab().save(path, "PNG"):
+        pix = self.grab()
+        if self.spec_pop.isVisible():
+            # the spectrum readout is a separate top-level window, which grab() leaves out
+            p = QtGui.QPainter(pix)
+            self.spec_pop.render(p, self.spec_pop.pos() - self.mapToGlobal(QtCore.QPoint(0, 0)))
+            p.end()
+        if pix.save(path, "PNG"):
             self.msg.setText(f"Saved {path}")
         else:
             self.msg.setText("Save failed")
+
+    def save_trace_csv(self):
+        """Save the blue trace as currently displayed (15 s average or peak hold) as a CSV file."""
+        x, y = self.spec_avg_curve.getData()
+        if x is None or y is None or len(x) == 0:
+            self.msg.setText("No trace to save yet")
+            return
+        kind = "avg" if self.blue_mode == "avg" else "peak"
+        unit = "power" if self.an.raw else "snr"
+        path = os.path.join(os.getcwd(), datetime.now().strftime(f"airspy_{kind}_%Y%m%d_%H%M%S.csv"))
+        try:
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["frequency_kHz", f"{kind}_{unit}_dB"])
+                for xv, yv in zip(x, y):
+                    w.writerow([f"{xv:.4f}", f"{yv:.2f}"])
+        except OSError as e:
+            self.msg.setText(f"CSV save failed: {e}")
+            return
+        self.msg.setText(f"Saved {path}")
 
     def _set_marks_visible(self, on):
         self.show_marks = on
@@ -3075,6 +3414,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.wwv_on and self.wwv is not None:
             for rec in self.wwv.process():
                 self._on_wwv_minute(rec)
+        if self.cw_on and self.cw is not None:
+            for rec in self.cw.process():
+                self._on_cw(rec)
         if self.an.skip_tx:
             self._update_tx_label()
             blk = int(time.time() // NOISE_REPORT_S)
@@ -3256,4 +3598,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
