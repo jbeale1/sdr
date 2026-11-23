@@ -10,6 +10,11 @@ bottom of the window, or in a separate window after "Pop out".
 A WWV timing mode logs the clock offset of the receiver and the carrier frequency,
 and reads the WWV 100 Hz timecode to get date/time (if reception quality allows).
 There is also a morse decode mode (not above 22 wpm though).
+Track mode follows every signal on screen and logs each transmission: start, length,
+gap since the same frequency last went quiet (turnaround), level and width. Output goes
+to the decodes pane and to track_YYYYmmdd_HHMMSS.csv in the current directory.
+The Settings menu holds raw/SNR display, time average and the FFT size. Changing the FFT
+size takes effect at once; the waterfall and background average start again.
 
 -J.Beale N8JUF  22-Nov-2026
 
@@ -43,12 +48,13 @@ import scipy.signal as ssig
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.20.0"
+VERSION = "0.27.0"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
 DEFAULT_RATE = 192_000
 DEFAULT_NFFT = 131072
+NFFT_CHOICES = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]   # Settings > FFT size
 MAX_DISPLAY_COLS = 2048
 RING_SECONDS = 17               # ring must hold a full 15 s FT8 slot plus margin
 HEADROOM_DB = 40.0              # colour range above the calibrated top
@@ -674,6 +680,119 @@ class TxDetector:
                      "snr": snr,
                      "dur": self.last_above - self.cand}
         self.new_result = self.last
+
+
+# Track mode: follows each signal in the span across display rows and reports every transmission.
+# A new transmission must rise well above the band floor; an existing one continues while it stays
+# above a lower level (hysteresis), so the skirts of a strong signal do not start tracks of their own.
+# Runs are matched to tracks by frequency extent, so a transmission and its reply on the same
+# frequency are split apart by the gap between them.
+TRACK_START_DB = 12.0           # a new transmission must rise this far above the band floor
+TRACK_KEEP_DB = 6.0             # an existing one continues while above this
+TRACK_SMOOTH_KHZ = 0.5          # spectrum is smoothed over this width before thresholding
+TRACK_MIN_WIDTH_KHZ = 0.5       # narrower runs are ignored
+TRACK_MARGIN_KHZ = 0.5          # a run this close to a track's extent belongs to that track
+TRACK_HANG_S = 0.03             # a dropout longer than this ends a transmission (keep it near one row)
+TRACK_MIN_S = 0.10              # shorter tracks are not logged
+TRACK_RECENT = 50               # finished transmissions remembered for the turnaround (gap) time
+TRACK_CSV_FIELDS = ["track", "utc_start", "epoch_start", "dur_ms", "gap_ms",
+                    "center_khz", "peak_db", "width_khz", "raw"]
+
+
+class TrackDetector:
+    """Track mode. feed() takes one display row at a time and returns the transmissions that ended
+    on it. gap_ms is the time since the same frequency last went quiet, i.e. the turnaround."""
+
+    def __init__(self):
+        self.active = []        # transmissions in progress: frequency extent, level, timing
+        self.recent = []        # (lo, hi, t_end) of finished transmissions, for the gap time
+        self.next_id = 1
+
+    def flush(self):
+        """End every transmission in progress (retune, pause, leaving the mode). Returns their records."""
+        out = [r for r in (self._close(tr) for tr in self.active) if r is not None]
+        self.active = []
+        self.recent = []
+        return out
+
+    def _close(self, tr):
+        dur = tr["t_end"] - tr["t_start"]
+        if dur < TRACK_MIN_S:
+            return None                 # a blip: not a transmission, and not a gap reference either
+        self.recent = (self.recent + [(tr["lo"], tr["hi"], tr["t_end"])])[-TRACK_RECENT:]
+        return {"id": tr["id"], "t_start": tr["t_start"], "t_end": tr["t_end"], "dur_s": dur,
+                "gap_s": tr["gap_s"], "center_khz": tr["csum"] / tr["n"],
+                "peak_db": tr["peak"], "width_khz": tr["hi"] - tr["lo"]}
+
+    def feed(self, row_db, freq_khz, t):
+        """One display row at wall-clock time t (s). Returns the transmissions that ended on this row."""
+        f = np.asarray(freq_khz, dtype=float)
+        if f.size < 4:
+            return []
+        df = abs(f[1] - f[0]) or 1e-9
+        n_sm = min(f.size, max(1, int(round(TRACK_SMOOTH_KHZ / df))))
+        lin = 10.0 ** (np.asarray(row_db, dtype=float) / 10.0)
+        sm = 10.0 * np.log10(np.convolve(lin, np.ones(n_sm) / n_sm, mode="same") + 1e-30)
+        floor = float(np.percentile(sm, 25))
+        keep = sm > floor + TRACK_KEEP_DB
+        min_bins = max(2, int(round(TRACK_MIN_WIDTH_KHZ / df)))
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], keep.astype(np.int8), [0]))))
+        updated = set()
+        for a, b in zip(edges[::2], edges[1::2]):
+            if b - a < min_bins:
+                continue
+            lo, hi = sorted((float(f[a]), float(f[b - 1])))
+            c = float(f[a:b].mean())
+            pk = float(sm[a:b].max())
+            match = next((tr for tr in self.active
+                          if tr["lo"] - TRACK_MARGIN_KHZ <= hi and lo <= tr["hi"] + TRACK_MARGIN_KHZ),
+                         None)
+            if match is None:
+                if pk - floor < TRACK_START_DB:
+                    continue            # too faint to start a transmission
+                prev = [te for rlo, rhi, te in self.recent
+                        if rlo - TRACK_MARGIN_KHZ <= hi and lo <= rhi + TRACK_MARGIN_KHZ]
+                match = {"id": self.next_id, "t_start": t, "t_end": t,
+                         "gap_s": (t - max(prev)) if prev else None,
+                         "lo": lo, "hi": hi, "csum": 0.0, "n": 0, "peak": pk}
+                self.next_id += 1
+                self.active.append(match)
+            if id(match) in updated:
+                match["lo"], match["hi"] = min(match["lo"], lo), max(match["hi"], hi)
+            else:
+                match["lo"], match["hi"] = lo, hi
+                updated.add(id(match))
+            match["t_end"] = t
+            match["csum"] += c
+            match["n"] += 1
+            match["peak"] = max(match["peak"], pk)
+        done, still = [], []
+        for tr in self.active:
+            if t - tr["t_end"] <= TRACK_HANG_S:
+                still.append(tr)
+            else:
+                rec = self._close(tr)
+                if rec is not None:
+                    done.append(rec)
+        self.active = still
+        return done
+
+
+def track_line(r, raw):
+    """One decodes-pane line for a finished transmission."""
+    unit = "dB (raw)" if raw else "dB SNR"
+    stamp = datetime.fromtimestamp(r["t_start"], timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+    gap ="--" if r["gap_s"] is None else f"{r['gap_s'] * 1e3:.0f} ms"
+    return (f"{stamp} UTC  track {r['id']:<4d} {r['center_khz'] / 1e3:.4f} MHz  "
+            f"dur {r['dur_s'] * 1e3:.0f} ms  gap {gap}  peak {r['peak_db']:+.1f} {unit}  "
+            f"width {r['width_khz']:.1f} kHz")
+
+
+def track_csv_row(r, raw):
+    t0 = datetime.fromtimestamp(r["t_start"], timezone.utc)
+    return [r["id"], t0.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], f"{r['t_start']:.3f}",
+            f"{r['dur_s'] * 1e3:.0f}", "" if r["gap_s"] is None else f"{r['gap_s'] * 1e3:.0f}",
+            f"{r['center_khz']:.3f}", f"{r['peak_db']:.2f}", f"{r['width_khz']:.3f}", int(raw)]
 
 
 # ---- CW decoder: Morse on/off keying of the strongest carrier in the display window ----
@@ -1378,6 +1497,7 @@ class Analyzer:
         self.row_s = self.hop / rate                                 # seconds per waterfall row
         self.avg_s = avg_s
         self.alpha = min(1.0, self.row_s / max(avg_s, self.row_s))   # time-average weight
+        self.avg_on = True      # time averaging requested (see set_avg)
         self.next_pos = None
         self.ema = None         # time-averaged power, per bin
         self.bg = None          # background level, dB, per bin
@@ -1397,7 +1517,21 @@ class Analyzer:
 
     def set_avg(self, on):
         """Time-average the waterfall over avg_s seconds, or show each row's own power."""
+        self.avg_on = on
         self.alpha = min(1.0, self.row_s / max(self.avg_s, self.row_s)) if on else 1.0
+
+    def set_nfft(self, nfft):
+        """Change the FFT size in place. The bin grid and row timing change, so configure() must
+        follow to rebuild the displayed bins and reset the averages."""
+        self.nfft = nfft
+        self.hop = nfft // 2
+        self.win = np.hanning(nfft).astype(np.float32)
+        self.max_frames = max(1, 2_000_000 // nfft)
+        self.freqs = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / self.rate))
+        self.row_s = self.hop / self.rate
+        self.long_alpha = min(1.0, self.row_s / max(SPEC_AVG_S, self.row_s))
+        self.set_avg(self.avg_on)
+        self.next_pos = None
 
     def restart_average(self):
         """Make the 15 s average equal the current live trace and restart averaging from it."""
@@ -1418,6 +1552,7 @@ class Analyzer:
         self.gated_s = None
         self.n_rows = 0
         self.ema_long = None
+        self.spec_avg_db = None
         self.peak_db = None
         if settle_s > 0:
             self.next_pos = self.ring.total + int(settle_s * self.rate)
@@ -1763,9 +1898,10 @@ class StatsWindow(QtWidgets.QWidget):
     SUMMARY = ["Decodes", "Calls", "CQs", "2-way"]
     TITLE_FG = QtGui.QColor(190, 190, 190)     # header titles: bold, but not full white
 
-    def __init__(self, source):
+    def __init__(self, source, clear_fn=None):
         super().__init__(None, QtCore.Qt.Window)
         self.source = source            # callable returning (stats dict, mode)
+        self.clear_fn = clear_fn        # empties the owner's stats; the table is rebuilt after it
         self.setWindowTitle("FT8 stats")
         self.resize(860, 480)
         self.table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
@@ -1799,6 +1935,9 @@ class StatsWindow(QtWidgets.QWidget):
             summary.addSpacing(14)
             self.summary_vals[name] = val
         summary.addStretch(1)
+        btn_clear = QtWidgets.QPushButton("Clear")
+        btn_clear.clicked.connect(self.clear)
+        summary.addWidget(btn_clear)
         summary_box = QtWidgets.QWidget()
         summary_box.setLayout(summary)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
@@ -1832,6 +1971,11 @@ class StatsWindow(QtWidgets.QWidget):
 
     def mark_dirty(self):
         self.dirty = True
+
+    def clear(self):
+        if self.clear_fn is not None:
+            self.clear_fn()
+        self.rebuild()
 
     def _refresh_if_due(self):
         if self.dirty and self.isVisible():
@@ -1987,11 +2131,14 @@ class WwvStatsWindow(QtWidgets.QWidget):
         btn_save.clicked.connect(self.save_csv)
         btn_cap = QtWidgets.QPushButton("Save 10 s...")
         btn_cap.clicked.connect(self.save_capture)
+        btn_clear = QtWidgets.QPushButton("Clear")
+        btn_clear.clicked.connect(self.clear)
         top = QtWidgets.QHBoxLayout()
         top.addWidget(self.summary, 1)
         top.addWidget(btn_copy)
         top.addWidget(btn_save)
         top.addWidget(btn_cap)
+        top.addWidget(btn_clear)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.addLayout(top)
@@ -2003,6 +2150,12 @@ class WwvStatsWindow(QtWidgets.QWidget):
         chk.setChecked(False)
         chk.toggled.connect(lambda on: self.onset_log_fn and self.onset_log_fn(on))
         lay.addWidget(chk)
+
+    def clear(self):
+        """Empty the minute table and the clock-offset summary."""
+        self.recent.clear()
+        self.table.setRowCount(0)
+        self.summary.setText("No minutes yet")
 
     def add(self, rec, mhz):
         car = rec["carrier"]
@@ -2153,6 +2306,38 @@ class AudioOffsetAxis(pg.AxisItem):
         return [f"{v * 1e3 - self.tune_hz:.0f}" for v in values]     # values are in kHz
 
 
+def utc_tick_values(ref, lo, hi):
+    """Ticks for a waterfall y range lo..hi (seconds, 0 = the newest row at wall time ref), placed on
+    whole seconds past the UTC minute. Returns (step_s, y values)."""
+    span = abs(hi - lo)
+    step = next((s for s in (1, 2, 5, 10, 15, 30, 60) if span / s <= 12), 60)
+    w = math.ceil((ref + min(lo, hi)) / step) * step
+    vals = []
+    while w <= ref + max(lo, hi):
+        vals.append(w - ref)
+        w += step
+    return step, vals
+
+
+class UtcSecondsAxis(pg.AxisItem):
+    """Left axis of the waterfall: seconds past the UTC minute. The axis is anchored to the newest
+    row's wall-clock time, so the ticks move down with the rows."""
+
+    def __init__(self, ref_fn):
+        super().__init__("left")
+        self.ref_fn = ref_fn
+        self._ref = 0.0
+        self.enableAutoSIPrefix(False)
+
+    def tickValues(self, minVal, maxVal, size):
+        self._ref = float(self.ref_fn())
+        step, vals = utc_tick_values(self._ref, minVal, maxVal)
+        return [(step, vals)]
+
+    def tickStrings(self, values, scale, spacing):
+        return [f"{int(round(self._ref + v)) % 60:02d}" for v in values]
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, an, radio, ring, low_if, title, tune_hz, disp_off, span_hz,
                  jt9_path, shm_dir, all_txt, decode_ok, decode_start,
@@ -2171,6 +2356,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg_version = 0            # bumped on retune/span change
         self.cur_slot = None            # (boundary_time, sample_index, cfg_version)
         self.paused = False             # True: receiver stopped, display frozen
+        self.newest_wall = time.time()  # wall-clock time of the newest waterfall row (UTC axis origin)
+        self.clock_sec = -1             # whole second last shown in the UTC clock
+        self.clock_min = -1             # UTC minute last shown on the waterfall
         self.noise_blk = 0
         self.blue_mode = "avg"          # blue trace: "avg" (15 s average) or "peak" (peak hold)
         self.spec_y = None              # raw-mode spectrum y range currently set, (lo, hi) dB
@@ -2186,6 +2374,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cw_txt = os.path.join(os.path.dirname(os.path.abspath(all_txt)), "CW.TXT")
         self.onset_log_on = False       # write the onset CSV (debugging); set from the WWV window
         self.wwv_mhz = WWV_DEFAULT_MHZ  # WWV frequency last chosen from the menu
+        self.track_on = False           # Track mode: one line per transmission, logged to CSV
+        self.trk = None                 # TrackDetector while track_on
+        self.trk_n = 0                  # transmissions logged in this Track session
+        self.trk_path = None            # CSV file of this Track session
+        self.trk_file = None
+        self.trk_writer = None
 
         # Decode marks are drawn into the waterfall's own pixel buffer. Each mark records the
         # sample range of its slot, so it scrolls on the same clock as the waterfall rows.
@@ -2221,10 +2415,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spec_avg_curve = self.spec.plot(pen=pg.mkPen((0, 200, 255), width=2),
                                              name="15 s average")
 
-        self.wf_plot = pg.PlotWidget(axisItems={"top": AudioOffsetAxis()})
+        self.wf_plot = pg.PlotWidget(axisItems={"top": AudioOffsetAxis(),
+                                                "left": UtcSecondsAxis(lambda: self.newest_wall)})
         self.wf_plot.setLabel("bottom", "Frequency", units="kHz")
         self.row_s = an.hop / self.rate             # seconds per waterfall row
-        self.wf_plot.setLabel("left", "Time relative to now", units="s")
+        self.wf_plot.setLabel("left", "Seconds past UTC minute")
         self.wf_plot.getAxis("bottom").enableAutoSIPrefix(False)
         self.off_axis = self.wf_plot.getAxis("top")
         self.wf_plot.setLabel("top", "Audio offset", units="Hz")
@@ -2233,6 +2428,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wf_plot.setMouseEnabled(x=False, y=False)
         self.img = pg.ImageItem()
         self.wf_plot.addItem(self.img)
+        # UTC HH:MM sits in the empty top-left corner above the waterfall, level with the top axis labels
+        self.utc_min_lbl = QtWidgets.QLabel("----------\n--:-- UTC", self.wf_plot)
+        self.utc_min_lbl.setStyleSheet("background-color: rgba(0, 0, 0, 170); color: #e6e6e6; "
+                                       "font-family: monospace; font-weight: bold; padding: 1px 4px;")
+        self.utc_min_lbl.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.utc_min_lbl.adjustSize()
+        self.utc_min_lbl.move(6, (COUNT_AXIS_H - self.utc_min_lbl.height()) // 2)
         self.wf_plot.getAxis("top").setHeight(COUNT_AXIS_H)
         self.wf_plot.getAxis("bottom").setHeight(COUNT_AXIS_H)
         # narrow strip right of the waterfall: one decode count per slot, scrolls with the rows
@@ -2271,7 +2473,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # mode menu: FT8, FT4, Off, and a WWV submenu (frequencies, timing window, capture)
         self.mode_menu = QtWidgets.QMenu(self)
         self.mode_actions = {}
-        for name in ("FT8", "FT4", "CW", "Off"):
+        for name in ("FT8", "FT4", "CW", "Track", "Off"):
             a = self.mode_menu.addAction(name)
             a.setCheckable(True)
             a.triggered.connect(lambda _=False, n=name: self._on_mode_action(n))
@@ -2303,6 +2505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.band_box.addItem("Band...", None)
         for name, ft8_mhz, ft4_mhz in BANDS:
             self.band_box.addItem(name, (ft8_mhz, ft4_mhz))
+        self.band_box.setMaxVisibleItems(self.band_box.count())     # every band shows without scrolling
         self.band_box.currentIndexChanged.connect(self.on_band)
         self.span_box = QtWidgets.QComboBox()
         for name, khz in SPAN_PRESETS:
@@ -2334,14 +2537,30 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(self.mode_btn)
         controls.addWidget(self.btn_marks)
         controls.addWidget(self.btn_calls)
-        self.chk_raw = QtWidgets.QCheckBox("Raw power")
-        self.chk_raw.setChecked(True)
-        controls.addWidget(self.chk_raw)
-        self.chk_avg = QtWidgets.QCheckBox("Time avg")
-        self.chk_avg.setChecked(False)
+        # Settings menu: display options, and the FFT size (applied in place)
+        self.settings_menu = QtWidgets.QMenu(self)
+        self.act_raw = self.settings_menu.addAction("Raw power")
+        self.act_raw.setCheckable(True)
+        self.act_raw.setChecked(True)
+        self.act_avg = self.settings_menu.addAction("Time average")
+        self.act_avg.setCheckable(True)
+        self.act_avg.setChecked(False)
         self.an.set_avg(False)          # startup default: no time average
-        self.chk_avg.toggled.connect(self.an.set_avg)
-        controls.addWidget(self.chk_avg)
+        self.act_avg.toggled.connect(self.an.set_avg)
+        self.settings_menu.addSeparator()
+        self.nfft_menu = self.settings_menu.addMenu("FFT size")
+        self.nfft_group = QtGui.QActionGroup(self)
+        self.nfft_actions = {}
+        for n in NFFT_CHOICES:
+            a = self.nfft_menu.addAction(f"{n}   bin {self.rate / n:.2f} Hz")
+            a.setCheckable(True)
+            a.setChecked(n == self.an.nfft)
+            self.nfft_group.addAction(a)
+            a.triggered.connect(lambda _=False, n=n: self._on_nfft_action(n))
+            self.nfft_actions[n] = a
+        self.btn_settings = QtWidgets.QPushButton("Settings  ▾")
+        self.btn_settings.setMenu(self.settings_menu)
+        controls.addWidget(self.btn_settings)
         controls.addStretch(1)
         self.btn_exit = QtWidgets.QPushButton("Exit")
         controls.addWidget(self.btn_exit)
@@ -2358,8 +2577,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_exit.clicked.connect(self.exit_app)
         self.btn_marks.toggled.connect(self._set_marks_visible)
         self.btn_calls.toggled.connect(self._set_calls_visible)
-        self.chk_raw.toggled.connect(self._on_raw_toggled)
-        self.spec.setLabel("left", "Power" if self.chk_raw.isChecked() else "SNR", units="dB")
+        self.act_raw.toggled.connect(self._on_raw_toggled)
+        self.spec.setLabel("left", "Power" if self.act_raw.isChecked() else "SNR", units="dB")
 
         # --- one status line: radio/FFT info, transient messages, version
         self.status = QtWidgets.QLabel()
@@ -2368,6 +2587,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.version_label.setStyleSheet("color: #808080;")
         status_row = QtWidgets.QHBoxLayout()
         self.rate_label = QtWidgets.QLabel()
+        self.utc_label = QtWidgets.QLabel("UTC --:--:--")
+        self.utc_label.setStyleSheet("font-family: monospace; font-weight: bold;")
+        status_row.addWidget(self.utc_label)
         status_row.addWidget(self.status)
         self.tx_label = QtWidgets.QLabel()
         status_row.addWidget(self.rate_label)
@@ -2406,8 +2628,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.decode_dock.setObjectName("decodes_dock")
         self.decode_dock.setWidget(self.decode_pane)
         self.decode_pane.top_bar.layout().addWidget(self.btn_popout)
-        self.btn_clear_log = QtWidgets.QPushButton("Clear log")
-        self.btn_clear_log.setVisible(False)
+        self.btn_clear_log = QtWidgets.QPushButton("Clear log")     # clears the decodes window in every mode
         self.btn_clear_log.clicked.connect(self._clear_log)
         self.decode_pane.top_bar.layout().addWidget(self.btn_clear_log)
         self.chk_noise = QtWidgets.QCheckBox("Noise stats")
@@ -2435,7 +2656,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.popout.closed.connect(self.dock_back)
         self.popped = False             # True while the history lives in the popout window
 
-        self.stats_win = StatsWindow(lambda: (self.stats, self.stats_mode))
+        self.stats_win = StatsWindow(lambda: (self.stats, self.stats_mode), clear_fn=self._clear_stats)
         self.decode_pane.btn_stats.clicked.connect(self.show_stats)
         self.wwv_win = WwvStatsWindow(capture_fn=self.save_wwv_capture,
                                       onset_log_fn=self.set_onset_log)
@@ -2547,6 +2768,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- configuration
     def _configure(self, settle):
+        self._flush_tracks()            # a new frequency axis ends any transmission in progress
         self.spec_y = None              # refit the spectrum axis to the new span
         half = self.rate / 2
         lo = max(self.disp_off - self.span_hz / 2, -half)
@@ -2599,6 +2821,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- decode mode: FT8, FT4, WWV or off (one at a time)
     def _on_mode_action(self, name):
+        if name == "Track":
+            self._enter_track()
+            self._select_mode_box("Track")
+            return
+        if self.track_on:
+            self._leave_track()
         if self.wwv_on:
             self._leave_wwv()
         if name == "CW":
@@ -2738,6 +2966,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _enter_tx_mode(self):
         self.an.tx.reset_events()
+        if self.track_on:
+            self._leave_track()
         if self.wwv_on:
             self._leave_wwv()
         if self.cw_on:
@@ -2745,7 +2975,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_mode(None)                    # Tx Test, WWV and FT8/FT4 are mutually exclusive
         self._select_mode_box("Off")
         self.decode_dock.setWindowTitle("Tx log")
-        self.btn_clear_log.setVisible(True)
         self.chk_noise.setVisible(True)
         self.btn_ref_reset.setVisible(True)
         self.btn_check_noise.setVisible(True)
@@ -2755,14 +2984,89 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _leave_tx_mode(self):
         self.tx_label.setText("")
-        self.btn_clear_log.setVisible(False)
         self.chk_noise.setVisible(False)
         self.btn_ref_reset.setVisible(False)
         self.btn_check_noise.setVisible(False)
         self.decode_dock.setWindowTitle("Decodes")
 
+    # ---- Track mode: one decodes-pane line and one CSV row per transmission
+    def _enter_track(self):
+        if self.track_on:
+            return
+        if self.cw_on:
+            self._leave_cw()
+        if self.wwv_on:
+            self._leave_wwv()
+        if self.an.skip_tx:
+            self.blue_box.setCurrentIndex(self.blue_box.findData("peak"))
+        self._set_mode(None)
+        self.track_on = True
+        self.trk = TrackDetector()
+        self.trk_n = 0
+        self.trk_path = os.path.join(os.getcwd(), datetime.now().strftime("track_%Y%m%d_%H%M%S.csv"))
+        self.trk_file, self.trk_writer = None, None
+        try:
+            self.trk_file = open(self.trk_path, "w", newline="")
+            self.trk_writer = csv.writer(self.trk_file)
+            self.trk_writer.writerow(TRACK_CSV_FIELDS)
+        except OSError as e:
+            self.msg.setText(f"Track CSV not written: {e}")
+        self.decode_dock.setWindowTitle("Track log")
+        self.popout.setWindowTitle("Track log")
+        self._select_mode_box("Track")
+        self.rate_label.setText("")
+        self.tx_label.setText("Track: listening")
+
+    def _leave_track(self):
+        self._flush_tracks()
+        self.track_on = False
+        self.trk = None
+        if self.trk_file is not None:
+            self.trk_file.close()
+        self.trk_file, self.trk_writer = None, None
+        self.tx_label.setText("")
+        self.decode_dock.setWindowTitle("Decodes")
+        self.popout.setWindowTitle("Decodes")
+        self._update_rate()
+
+    def _flush_tracks(self):
+        if self.trk is not None:
+            self._log_tracks(self.trk.flush())
+
+    def _log_tracks(self, recs):
+        for r in recs:
+            self.decode_pane.append(track_line(r, self.an.raw), False)
+            if self.trk_writer is not None:
+                self.trk_writer.writerow(track_csv_row(r, self.an.raw))
+            self.trk_n += 1
+        if recs and self.trk_file is not None:
+            self.trk_file.flush()
+
+    def _update_wf_clock(self):
+        """Waterfall label: UTC date and minute of the newest row, the same reference as the seconds
+        axis. Only changes when rows arrive, so it stays fixed while the display is paused."""
+        minute = int(self.newest_wall // 60)
+        if minute != self.clock_min:
+            self.clock_min = minute
+            self.utc_min_lbl.setText(time.strftime("%Y-%m-%d\n%H:%M UTC", time.gmtime(minute * 60)))
+            self.utc_min_lbl.adjustSize()
+
+    def _feed_track(self, rows_db):
+        """Feed the newest display rows to the track detector. Row times are wall-clock: the newest
+        row is the centre of the newest FFT frame, and each earlier row is one row earlier."""
+        k = rows_db.shape[0]
+        newest = self.newest_wall
+        closed = []
+        for i in range(k):
+            closed.extend(self.trk.feed(rows_db[i], self.an.freq_khz,
+                                        newest - (k - 1 - i) * self.row_s))
+        self._log_tracks(closed)
+        self.tx_label.setText(f"Track: {self.trk_n} logged, {len(self.trk.active)} in progress")
+
     # ---- CW mode: Morse decoder on the strongest keyed carrier in a 3 kHz window
     def _enter_cw(self):
+        if self.track_on:
+            self._leave_track()
         if self.an.skip_tx:
             self.blue_box.setCurrentIndex(self.blue_box.findData("peak"))
         self._set_mode(None)
@@ -2798,6 +3102,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- WWV timing mode: tuned to a WWV frequency with decoding off; separate from Tx Test
     def _enter_wwv(self, mhz):
+        if self.track_on:
+            self._leave_track()
         if self.cw_on:
             self._leave_cw()
         if self.an.skip_tx:
@@ -2879,8 +3185,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_noise(rep)
 
     def _clear_log(self):
+        """Clear button: empties the lines shown in the decodes window (the CW, Track, Tx or FT8 log).
+        Files on disk (ALL.TXT, CW.TXT, track CSV) are not touched."""
         for view in (self.decode_pane.view, self.decode_pane.view_cq, self.decode_pane.view_other):
             view.clear()
+
+    def _clear_stats(self):
+        """Clear button on the FT8 stats window: start the per-callsign totals again."""
+        self.stats = {}
+
+    # ---- Settings: FFT size, applied in place
+    def _on_nfft_action(self, n):
+        """The waterfall and the background average start again. Frequency, span, band and mode are kept."""
+        if n == self.an.nfft:
+            return
+        self.an.set_nfft(n)
+        self.row_s = self.an.row_s
+        self.cfg_version += 1          # decodes still in flight were built on the old rows
+        self._configure(settle=False)  # rebuilds the displayed bins, averages and the rate detector
+        self._refresh()                # re-sizes the waterfall buffer and updates the status line
 
     def _update_tx_label(self):
         tx = self.an.tx
@@ -2896,6 +3219,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tx_label.setText(text)
 
     def _set_paused(self, on):
+        self._flush_tracks()            # pausing or resuming ends any transmission in progress
         self.paused = on
         self.btn_pause.setText("Resume" if on else "Pause")
         if on:
@@ -3392,6 +3716,10 @@ class MainWindow(QtWidgets.QMainWindow):
             b += slot_s
 
     def tick(self):
+        sec = int(time.time())
+        if sec != self.clock_sec:
+            self.clock_sec = sec
+            self.utc_label.setText("UTC " + time.strftime("%H:%M:%S", time.gmtime(sec)))
         if self.paused:
             return
         h = int(self.wf_plot.getViewBox().height())
@@ -3411,6 +3739,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cur_slot = (slot_b, self._index_at(now, slot_b), self.cfg_version)
 
         rows_db, spec_db = self.an.process()
+        if rows_db is not None:
+            self.newest_wall = time.time() - self.an.nfft / (2.0 * self.rate)
+            self._update_wf_clock()
+        if self.track_on and self.trk is not None and rows_db is not None:
+            self._feed_track(rows_db)
         if self.wwv_on and self.wwv is not None:
             for rec in self.wwv.process():
                 self._on_wwv_minute(rec)
@@ -3460,6 +3793,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._compose()
             self._sync_call_labels()
             self._sync_count_labels()
+            self.wf_plot.getAxis("left").picture = None     # UTC ticks move with the rows
+            self.wf_plot.getAxis("left").update()
             self.dirty = False
 
 # ------------------------------------------------------------ main
