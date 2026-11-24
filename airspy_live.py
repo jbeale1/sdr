@@ -10,13 +10,18 @@ bottom of the window, or in a separate window after "Pop out".
 A WWV timing mode logs the clock offset of the receiver and the carrier frequency,
 and reads the WWV 100 Hz timecode to get date/time (if reception quality allows).
 There is also a morse decode mode (not above 22 wpm though).
+
+FM mode decodes Morse sent as a 400 Hz FM tone keyed on a carrier, from the sidebands of the
+carrier. Output goes to the decodes pane and to FM.TXT in the current directory.
+
 Track mode follows every signal on screen and logs each transmission: start, length,
 gap since the same frequency last went quiet (turnaround), level and width. Output goes
 to the decodes pane and to track_YYYYmmdd_HHMMSS.csv in the current directory.
+
 The Settings menu holds raw/SNR display, time average and the FFT size. Changing the FFT
 size takes effect at once; the waterfall and background average start again.
 
--J.Beale N8JUF  22-Nov-2026
+-J.Beale N8JUF  23-Nov-2026
 
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
@@ -28,6 +33,7 @@ import csv
 import ctypes
 import ctypes.util
 import io
+import itertools
 import json
 import os
 import math
@@ -45,10 +51,11 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import scipy.fft as sfft
 import scipy.signal as ssig
+import scipy.special as sspec
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.27.0"
+VERSION = "0.34.0"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -811,6 +818,7 @@ CW_LEVEL_S = 3.0               # recent level history (key-down level), so each 
 CW_QUEUE_S = 5.0                # frames kept until a threshold exists
 CW_TX_END_S = 2.5               # this much key-up ends a transmission
 CW_MIN_ON_S = 0.035             # shorter key-down blips are treated as noise (dit at 22 wpm is 55 ms)
+CW_TRACE_S = 10.0               # comb level history kept for the FM level plot
 CW_WPM_MIN = 8.0
 CW_WPM_MAX = 22.0
 CW_MIN_CHARS = 3                # a transmission needs this many recognised characters to be logged
@@ -871,24 +879,33 @@ def cw_line(rec):
             f"raw {rec['raw']:+.1f} dB  SNR {rec['snr']:+.1f} dB  {rec['dur']:.1f} s")
 
 
+_TX_IDS = itertools.count(1)                     # transmission numbers, unique across decoders
+STREAM_UNIT_GUESS_S = 0.1                        # dit length used before a transmission has an estimate (12 wpm)
+
+
 class CwDecoder:
     """CW decoder for the strongest on/off-keyed carrier in a display window. Band power around
     the carrier is sampled every CW_HOP_S. Key-down runs are grouped into transmissions, and each
     transmission is decoded when it ends. Raw level is the mean key-down band power in dB
     (uncalibrated); SNR is that above the key-up level."""
 
+    STREAM_CHARS = False                             # True: characters are emitted as they complete
+    FFT_N = CW_N                                     # FFT length (a subclass may use another)
+
     def __init__(self, ring, rate):
         self.ring = ring
         self.rate = rate
+        self.nfft = self.FFT_N
         self.hop = max(1, int(round(CW_HOP_S * rate)))
-        self.win = np.hanning(CW_N).astype(np.float32)
+        self.win = np.hanning(self.nfft).astype(np.float32)
         self.wnorm = float(np.sum(self.win.astype(np.float64) ** 2))
-        self.freqs = np.fft.fftshift(np.fft.fftfreq(CW_N, 1.0 / rate))
+        self.freqs = np.fft.fftshift(np.fft.fftfreq(self.nfft, 1.0 / rate))
         self.a_avg = self.hop / (CW_AVG_S * rate)
         self.hist_len = int(CW_HIST_S * rate / self.hop)
         self.recent_len = int(CW_LEVEL_S * rate / self.hop)
         self.queue_len = int(CW_QUEUE_S * rate / self.hop)
-        self.win_mask = np.ones(CW_N, dtype=bool)
+        self.trace_len = int(CW_TRACE_S * rate / self.hop)
+        self.win_mask = np.ones(self.nfft, dtype=bool)
         self.tune_hz = 0
         self.reset()
 
@@ -905,8 +922,11 @@ class CwDecoder:
         self.fc = None                                   # carrier offset from tuning, Hz
         self.band = None                                 # bins summed for the carrier power
         self.hist = deque(maxlen=self.hist_len)          # band level, dB, for the noise floor
+        self.aux_hist = deque(maxlen=self.hist_len)      # second feature in dB over 30 s
+        self.aux_recent = deque(maxlen=self.recent_len)  # second feature in dB (FM carrier), for the fit
         self.recent = deque(maxlen=self.recent_len)      # band level, dB, for the key-down level
         self.sm = deque(maxlen=CW_SMOOTH_FRAMES)         # recent band powers, for smoothing
+        self.trace = deque(maxlen=self.trace_len)        # (centre, level dB, threshold dB, key-up dB, key down)
         self.queue = deque(maxlen=self.queue_len)        # (centre sample, level) awaiting decisions
         self.thr = None                                  # key-down threshold, dB (None until keying is seen)
         self.noise_db = None                             # key-up level, dB
@@ -915,32 +935,42 @@ class CwDecoder:
         self.run_t0 = 0
         self.run_pow = 0.0
         self.closed = []                                 # finished runs since the last transmission
+        self.events = []                                 # char and drop events for process() to return
+        self.tx_id = None                                # number of the transmission being accumulated
+        self.tx_chars = 0                                # characters already emitted for it
+        self.stream_unit = None                          # dit length from the last streamed estimate, s
+        self.gap_fired = False                           # the open key-up gap has been checked for a character
 
     def process(self, now=None):
         """Measure new frames and return the transmissions that ended since the last call."""
         ring, hop = self.ring, self.hop
         total = ring.total
         now = time.time() if now is None else now
-        if total < CW_N:
+        n = self.nfft
+        if total < n:
             return []
-        if self.pos is None or total - self.pos > ring.size - CW_N:
-            self.pos = total - CW_N
+        if self.pos is None or total - self.pos > ring.size - n:
+            self.pos = total - n
         avail = total - self.pos
-        if avail < CW_N:
+        if avail < n:
             return []
-        k = min((avail - CW_N) // hop + 1, 200)
-        seg = ring.read(self.pos, (k - 1) * hop + CW_N)
+        k = min((avail - n) // hop + 1, 200)
+        seg = ring.read(self.pos, (k - 1) * hop + n)
         if seg is None:
             self.pos = None
             return []
         base = self.pos
         self.pos += k * hop
-        frames = np.lib.stride_tricks.sliding_window_view(seg, CW_N)[::hop] * self.win
+        frames = np.lib.stride_tricks.sliding_window_view(seg, n)[::hop] * self.win
         X = np.fft.fftshift(np.fft.fft(frames, axis=1), axes=1)
         P = X.real * X.real + X.imag * X.imag
         for i in range(k):
-            self._frame(P[i], base + i * hop + CW_N // 2)
-        return self._drain(total, now)
+            self._frame(P[i], base + i * hop + n // 2)
+        out = self._drain(total, now)
+        if self.events:
+            out = self.events + out
+            self.events = []
+        return out
 
     def _frame(self, Pi, center):
         self.frame_n += 1
@@ -951,66 +981,144 @@ class CwDecoder:
         if self.fc is None or self.frame_n % CW_RESEL_FRAMES == 0:   # a carrier that appears is picked up within a few frames
             idx = int(np.argmax(np.where(self.win_mask, self.avg, -np.inf)))
             self.fc = float(self.freqs[idx])
-            self.band = np.flatnonzero(np.abs(self.freqs - self.fc) <= CW_BAND_HALF_HZ)
-        self.sm.append(float(np.sum(Pi[self.band])) / self.wnorm)
+            self._set_bands()
+        self.sm.append(self._power(Pi))
         env = sum(self.sm) / len(self.sm)
         lev = 10.0 * math.log10(env + 1e-30)
         self.hist.append(lev)
         self.recent.append(lev)
+        aux = self._aux(Pi)                              # appended before the fit so the histories match
+        aux_db = 10.0 * math.log10(aux + 1e-30)
+        self.aux_recent.append(aux_db)
+        self.aux_hist.append(aux_db)
         if self.frame_n % 20 == 0 and len(self.hist) >= 200:
-            lo = float(np.percentile(np.asarray(self.hist), 10))
-            hi = float(np.percentile(np.asarray(self.recent), 90))
-            self.noise_db = lo
-            self.thr = lo + 0.5 * max(hi - lo, 2.0 * CW_MIN_SEP_DB)
-        self.queue.append((center, env))
+            self._fit_levels()
+        self.queue.append((center, env, aux))
+
+    def _fit_levels(self):
+        """Key-up level (10th percentile of 30 s) and key-down threshold (halfway from there to the
+        90th percentile of the last 3 s)."""
+        lo = float(np.percentile(np.asarray(self.hist), 10))
+        hi = float(np.percentile(np.asarray(self.recent), 90))
+        self.noise_db = lo
+        self.thr = lo + 0.5 * max(hi - lo, 2.0 * CW_MIN_SEP_DB)
+
+    def _set_bands(self):
+        """Bins that make up the level, for the current carrier."""
+        self.band = np.flatnonzero(np.abs(self.freqs - self.fc) <= CW_BAND_HALF_HZ)
+
+    def _power(self, Pi):
+        """Linear power of one frame in the bins from _set_bands, normalised by the window."""
+        return float(np.sum(Pi[self.band])) / self.wnorm
+
+    def _aux(self, Pi):
+        """Second feature of one frame, linear power. The base decoder has none."""
+        return 0.0
+
+    def _closed_segs(self, closed, open_s=0.0):
+        """Key runs as [key down, seconds] segments. Runs too short to be elements become key up,
+        and neighbours of the same state merge. open_s adds a key-up run still in progress, and the
+        leading key-up is dropped. Returns (segs, t_first): t_first is the centre sample of the first
+        element."""
+        segs, t_first = [], None
+        for on, n, t0, _ in closed:
+            d = n * self.hop / self.rate
+            if on and d < CW_MIN_ON_S:
+                on = False
+            if on and t_first is None:
+                t_first = t0
+            if segs and segs[-1][0] == on:
+                segs[-1][1] += d
+            else:
+                segs.append([on, d])
+        if open_s > 0.0:
+            if segs and not segs[-1][0]:
+                segs[-1][1] += open_s
+            else:
+                segs.append([False, open_s])
+        while segs and not segs[0][0]:
+            segs.pop(0)
+        return segs, t_first
+
+    def _stream(self, open_s=0.0):
+        """Emit the characters of the current transmission that are complete (STREAM_CHARS only). A
+        character is complete once a key-up gap of two dits or more follows it. The dit length is
+        re-estimated from the transmission so far, so an early character can still change at the end."""
+        segs, t_first = self._closed_segs(self.closed, open_s)
+        ons = [d for on, d in segs if on]
+        if t_first is None or not ons:
+            return
+        offs = [d for on, d in segs if not on]
+        unit = cw_estimate_unit(ons, offs)
+        self.stream_unit = unit
+        chars = cw_char_times(segs, unit, final=False)
+        for ch, t0, t1 in chars[self.tx_chars:]:
+            self.events.append({"kind": "char", "tx": self.tx_id, "ch": ch,
+                                "sample": t_first + 0.5 * (t0 + t1) * self.rate})
+        self.tx_chars = max(self.tx_chars, len(chars))
 
     def _drain(self, total, now):
         """Decide key-down or key-up for queued frames once a threshold exists. Returns finished
         transmissions. Frames queued before the threshold are decided retroactively."""
         out = []
         while self.thr is not None and self.queue:
-            center, env = self.queue.popleft()
+            center, env, _ = self.queue.popleft()
             env_db = 10.0 * math.log10(env + 1e-30)
             on = self.run_on
             if on and env_db < self.thr - CW_HYST_DB:
                 on = False
             elif not on and env_db > self.thr + CW_HYST_DB:
                 on = True
-            if on != self.run_on:
-                if self.run_n:
-                    self.closed.append((self.run_on, self.run_n, self.run_t0, self.run_pow))
-                self.run_on, self.run_n, self.run_pow = on, 0, 0.0
-            if self.run_n == 0:
-                self.run_t0 = center
-            self.run_n += 1
-            self.run_pow += env
-            if not self.run_on and self.run_n * self.hop / self.rate >= CW_TX_END_S:
-                if any(r[0] for r in self.closed):
-                    rec = self._finish(total, now)
-                    if rec is not None:
-                        out.append(rec)
-                self.closed = []
+            self.trace.append((center, env_db, self.thr, self.noise_db, on,
+                               self.thr - CW_HYST_DB, self.thr + CW_HYST_DB))
+            rec = self._step(center, env, on, total, now)
+            if rec is not None:
+                out.append(rec)
         return out
 
+    def _step(self, center, env, on, total, now):
+        """Add one decided frame to the current run. Returns a finished transmission or None."""
+        if on != self.run_on:
+            if self.run_n:
+                self.closed.append((self.run_on, self.run_n, self.run_t0, self.run_pow))
+                if self.run_on:
+                    if self.tx_id is None:
+                        self.tx_id = next(_TX_IDS)
+                elif self.STREAM_CHARS and self.tx_id is not None:
+                    self._stream()                   # a key-up run has closed: a character may be complete
+            self.run_on, self.run_n, self.run_pow = on, 0, 0.0
+            self.gap_fired = False
+        if self.run_n == 0:
+            self.run_t0 = center
+        self.run_n += 1
+        self.run_pow += env
+        if self.run_on:
+            return None
+        gap_s = self.run_n * self.hop / self.rate
+        if (self.STREAM_CHARS and not self.gap_fired and self.tx_id is not None
+                and gap_s >= 2.0 * (self.stream_unit or STREAM_UNIT_GUESS_S)):
+            self.gap_fired = True                    # the key-up gap is already two dits: the character is complete
+            self._stream(open_s=gap_s)
+        if gap_s < CW_TX_END_S:
+            return None
+        rec = None
+        if any(r[0] for r in self.closed):
+            rec = self._finish(total, now)
+            if rec is None and self.tx_chars:
+                self.events.append({"kind": "drop", "tx": self.tx_id})
+        self.closed = []
+        self.tx_id, self.tx_chars, self.stream_unit = None, 0, None
+        return rec
+
     def _finish(self, total, now):
-        segs, on_pow, on_n, t_first = [], 0.0, 0, None
-        for on, n, t0, pw in self.closed:
-            d = n * self.hop / self.rate
-            if on and d < CW_MIN_ON_S:
-                on = False                               # too short to be an element
-            if on:
-                on_pow += pw
-                on_n += n
-                if t_first is None:
-                    t_first = t0
-            if segs and segs[-1][0] == on:
-                segs[-1][1] += d
-            else:
-                segs.append([on, d])
-        while segs and not segs[0][0]:
-            segs.pop(0)
+        segs, t_first = self._closed_segs(self.closed)
         while segs and not segs[-1][0]:
             segs.pop()
+        on_pow, on_n = 0.0, 0
+        for on, n, _, pw in self.closed:
+            if on and n * self.hop / self.rate >= CW_MIN_ON_S:
+                on_pow += pw
+                on_n += n
         ons = [d for on, d in segs if on]
         if not ons or t_first is None:
             return None
@@ -1026,7 +1134,410 @@ class CwDecoder:
                 "text": text,
                 "raw": raw,
                 "snr": raw - self.noise_db,
-                "dur": sum(d for _, d in segs)}
+                "dur": sum(d for _, d in segs),
+                "unit": unit,
+                "segs": segs,
+                "t_first": t_first,
+                "char_t": cw_char_times(segs, unit),
+                "kind": "tx", "tx": self.tx_id}
+
+
+# ---- FM keyed-tone decoder: Morse sent as a 400 Hz FM tone, read from the carrier's sidebands
+
+FM_TONE_HZ = 400.0                               # modulating tone: sidebands sit at carrier +/- 400 Hz x k
+FM_BETA = 6.25                                   # modulation index: 2.5 kHz deviation / 400 Hz tone
+FM_KS = [k for k in range(-7, 8) if k != 0]      # lines used; lines 9 to 11 are staircase images, so stop at 7
+FM_W = sspec.jv(np.asarray(FM_KS, dtype=np.float64), FM_BETA) ** 2   # Bessel line powers
+FM_W = FM_W / FM_W.sum()                         # matched weights, summing to 1
+FM_N = 4096                                      # FFT length: 47 Hz bins, enough to separate lines 400 Hz apart
+FM_SIDE_HALF_HZ = 60.0                           # each sideband line is summed over this half-width
+FM_SEGMENTER = "viterbi"                         # "viterbi" (two-state HMM) or "hysteresis" (threshold)
+FM_SWITCH_P = 0.05                               # per-frame chance of a key change (about 100 ms runs at 5 ms frames)
+FM_LAG_S = 0.3                                   # frames this old are committed; newer frames can still change
+FM_LAG_FRAMES = int(round(FM_LAG_S / CW_HOP_S))
+FM_FEATURE = "carrier3"                           # "carrier3": OFF/UP/DOWN states from comb and carrier; "comb"; "diff"
+FM_MIN_SEP_DB = 4.0                             # least key-down/key-up separation accepted by the level fit
+FM_HOLD_FRAMES = int(10.0 / CW_HOP_S)           # frames held (up to 10 s) until the levels exist
+FM_SMOOTH_FRAMES = 1                             # frames averaged before the level; 1 keeps the edges sharp
+
+
+def cw_char_times(segs, unit, final=True):
+    """Start and end of each decoded character, in seconds from the start of segs, as (char, t0, t1).
+    With final=False a character still open at the end of segs is left out: it is not yet complete."""
+    out, sym, t0, t1 = [], "", 0.0, 0.0
+    t = 0.0
+    for on, d in segs:
+        r = d / unit
+        if on:
+            if not sym:
+                t0 = t
+            sym += "." if r < 2 else "-"
+            t1 = t + d
+        elif r >= 2 and sym:                          # letter or word gap ends the character
+            out.append((CW_TEXT.get(sym, "#"), t0, t1))
+            sym = ""
+        t += d
+    if final and sym:
+        out.append((CW_TEXT.get(sym, "#"), t0, t1))
+    return out
+
+
+def cw_timing(segs, unit):
+    """Timing of a transmission against ideal Morse at the fitted speed. Returns (chars, on_dev, off_dev).
+    chars: (character, ms from its nearest decision boundary), smallest over its elements and the gap
+    after it; a word space is ("/", None). The boundaries are 2 units (dit/dah, intra/letter gap) and
+    5 units (letter/word gap). on_dev and off_dev: relative deviation of each key-down and key-up
+    duration from its ideal (dit 1, dah 3, gaps 1, 3, 7 units)."""
+    chars, sym, cmarg = [], "", []
+    on_dev, off_dev = [], []
+    for on, d in segs:
+        r = d / unit
+        if on:
+            ideal = 1.0 if r < 2 else 3.0
+            on_dev.append((r - ideal) / ideal)
+            cmarg.append(abs(r - 2.0))
+            sym += "." if r < 2 else "-"
+            continue
+        if r < 2:
+            off_dev.append(r - 1.0)
+            cmarg.append(abs(r - 2.0))
+            continue
+        if r < 5:
+            off_dev.append((r - 3.0) / 3.0)
+            cmarg.append(min(abs(r - 2.0), abs(r - 5.0)))
+            word = False
+        else:
+            off_dev.append((r - 7.0) / 7.0)
+            cmarg.append(abs(r - 5.0))
+            word = True
+        if sym:
+            chars.append((CW_TEXT.get(sym, "#"), min(cmarg) * unit * 1000.0))
+        if word:
+            chars.append(("/", None))
+        sym, cmarg = "", []
+    if sym:
+        chars.append((CW_TEXT.get(sym, "#"), min(cmarg) * unit * 1000.0))
+    return chars, on_dev, off_dev
+
+
+def fm_lines(rec):
+    """Two log lines for an FM transmission: the decode with timing summary, then the boundary
+    margin of each character."""
+    stamp = time.strftime("%H:%M:%S", time.gmtime(rec["wall"]))
+    chars, on_dev, off_dev = cw_timing(rec["segs"], rec["unit"])
+
+    def rms(v):
+        return 100.0 * math.sqrt(sum(x * x for x in v) / len(v)) if v else float("nan")
+
+    ms = [m for _, m in chars if m is not None]
+    closest = min(ms) if ms else float("nan")
+    head = (f"{stamp} UTC  {rec['mhz']:.4f} MHz  FM {rec['wpm']:.1f} wpm  {rec['text']}  "
+            f"raw {rec['raw']:+.1f} dB  SNR {rec['snr']:+.1f} dB  {rec['dur']:.1f} s  "
+            f"timing on +/-{rms(on_dev):.0f}% gap +/-{rms(off_dev):.0f}%  closest {closest:.0f} ms")
+    detail = "    closest call per character, ms to boundary: " + "  ".join(
+        ch if m is None else f"{ch} {m:.0f}" for ch, m in chars)
+    return [head, detail]
+
+
+def fm_gauss(x, mu, s):
+    """Gaussian log-likelihood (up to a constant) of each value."""
+    return -0.5 * ((np.asarray(x, dtype=np.float64) - mu) / s) ** 2 - math.log(s)
+
+
+def fm_loglik(x_db, mu0, s0, mu1, s1):
+    """Log-likelihood of each level under key up (column 0) and key down (column 1)."""
+    e = np.empty((len(x_db), 2))
+    e[:, 0] = fm_gauss(x_db, mu0, s0)
+    e[:, 1] = fm_gauss(x_db, mu1, s1)
+    return e
+
+
+def fm_trans2(p_sw):
+    """Log transition matrix for key up (0) and key down (1)."""
+    lstay, lsw = math.log(1.0 - p_sw), math.log(p_sw)
+    return np.array([[lstay, lsw], [lsw, lstay]])
+
+
+def fm_trans3(p_sw):
+    """Log transition matrix for OFF (0, no carrier), UP (1, carrier, tone off) and DOWN (2, carrier,
+    tone on). The carrier is on in UP and DOWN, so OFF connects only to UP."""
+    lstay, lsw = math.log(1.0 - p_sw), math.log(p_sw)
+    bad = -1e9
+    return np.array([[lstay, lsw, bad],
+                     [0.5 * lsw, lstay, 0.5 * lsw],
+                     [bad, lsw, lstay]])
+
+
+def fm_viterbi(e, trans, prev):
+    """Most likely state for each frame, given log-emissions e (frames by states) and a log transition
+    matrix. prev is the state before the first frame."""
+    T, K = e.shape
+    delta = trans[prev] + e[0]
+    back = np.zeros((T, K), dtype=np.int64)
+    for t in range(1, T):
+        cand = delta[:, None] + trans
+        back[t] = np.argmax(cand, axis=0)
+        delta = np.max(cand, axis=0) + e[t]
+    path = np.zeros(T, dtype=np.int64)
+    path[-1] = int(np.argmax(delta))
+    for t in range(T - 1, 0, -1):
+        path[t - 1] = back[t, path[t]]
+    return path
+
+
+class FmDecoder(CwDecoder):
+    """Keyed-tone decoder for FM transmissions. The carrier is located as in CwDecoder. The level is
+    the Bessel-weighted power of the sideband lines at carrier +/- 400 Hz x k: tone on gives the lines,
+    tone off gives the carrier alone. Key state comes from a two-state Viterbi pass over the frame
+    levels (FM_SEGMENTER = "viterbi"), or from the threshold of CwDecoder ("hysteresis"). Runs, timing
+    and Morse decoding are shared with CwDecoder."""
+
+    STREAM_CHARS = True
+    FFT_N = FM_N
+
+    def reset(self):
+        super().reset()
+        self.sm = deque(maxlen=FM_SMOOTH_FRAMES)
+        self.mu = None           # (key-up mean, key-down mean, key-up sd, key-down sd), dB; None until seen
+        self.vit = []            # (centre, linear power) frames not yet committed
+        self.prev = 0            # state of the last committed frame
+        self.aux_mu = None       # carrier dB: (OFF mean, OFF sd, UP mean, UP sd, DOWN mean, DOWN sd) or None
+
+    def _fit_levels(self):
+        if FM_SEGMENTER == "hysteresis":
+            super()._fit_levels()
+            self.mu = None
+            return
+        self.noise_db = float(np.percentile(np.asarray(self.hist), 10))
+        r = np.asarray(self.recent, dtype=np.float64)
+        if FM_FEATURE == "diff":                     # key down is high: comb minus carrier
+            r = r - np.asarray(self.aux_recent, dtype=np.float64)
+        m0, m1 = np.percentile(r, [10.0, 90.0])
+        for _ in range(10):                          # 1-D two-means on the last 3 s of levels
+            low = np.abs(r - m0) <= np.abs(r - m1)
+            if not low.any() or low.all():
+                break
+            n0, n1 = float(r[low].mean()), float(r[~low].mean())
+            if n0 == m0 and n1 == m1:
+                break
+            m0, m1 = n0, n1
+        low = np.abs(r - m0) <= np.abs(r - m1)
+        if not low.any() or low.all() or m1 - m0 < FM_MIN_SEP_DB or (~low).mean() < 0.05:
+            return                                   # no keying in this window: keep the last valid levels
+        s0 = max(float(r[low].std()), 0.5)
+        s1 = max(float(r[~low].std()), 0.5)
+        self.mu = (m0, m1, s0, s1)
+        self.thr = 0.5 * (m0 + m1)
+        self.aux_mu = None
+        if FM_FEATURE == "carrier3" and len(self.aux_hist) >= 200:
+            hc = np.asarray(self.hist, dtype=np.float64)
+            hq = np.asarray(self.aux_hist, dtype=np.float64)
+            cl = hq[hc < 0.5 * (m0 + m1)]                # carrier where the comb is key up: OFF and UP
+            if cl.size >= 50:
+                c0, c1 = np.percentile(cl, [10.0, 90.0])
+                for _ in range(10):
+                    lo_c = np.abs(cl - c0) <= np.abs(cl - c1)
+                    if not lo_c.any() or lo_c.all():
+                        break
+                    n0, n1 = float(cl[lo_c].mean()), float(cl[~lo_c].mean())
+                    if n0 == c0 and n1 == c1:
+                        break
+                    c0, c1 = n0, n1
+                lo_c = np.abs(cl - c0) <= np.abs(cl - c1)
+                if lo_c.any() and (~lo_c).any() and float(cl[~lo_c].mean() - cl[lo_c].mean()) >= 6.0:
+                    off_mu = float(cl[lo_c].mean())
+                    off_sd = max(float(cl[lo_c].std()), 0.5)
+                    q = np.asarray(self.aux_recent, dtype=np.float64)
+                    up = low & (q > off_mu + 8.0)
+                    dn = ~low
+                    if up.sum() >= 5 and dn.sum() >= 5:
+                        self.aux_mu = (off_mu, off_sd,
+                                       float(q[up].mean()), max(float(q[up].std()), 0.5),
+                                       float(q[dn].mean()), max(float(q[dn].std()), 0.5))
+
+    def _drain(self, total, now):
+        if FM_SEGMENTER == "hysteresis":
+            return super()._drain(total, now)
+        out = []
+        while self.queue:
+            self.vit.append(self.queue.popleft())
+        if self.mu is None and len(self.vit) < FM_HOLD_FRAMES:
+            return out                               # no levels yet: hold the frames, decide them later
+        n_commit = len(self.vit) - FM_LAG_FRAMES
+        if n_commit <= 0:
+            return out
+        comb = [10.0 * math.log10(env + 1e-30) for _, env, _ in self.vit]
+        nd = float("nan") if self.noise_db is None else self.noise_db
+        three = FM_FEATURE == "carrier3" and self.aux_mu is not None
+        if self.mu is None:                          # held too long without levels: call it key up
+            x = comb
+            path = np.zeros(len(x), dtype=np.int64)
+            mu0 = mu1 = mid = float("nan")
+            down = 1
+        elif three:
+            mu0, mu1, s0, s1 = self.mu
+            x = comb
+            off_mu, off_sd, up_mu, up_sd, dn_mu, dn_sd = self.aux_mu
+            c = [10.0 * math.log10(aux + 1e-30) for _, _, aux in self.vit]
+            lk0 = fm_gauss(comb, mu0, s0)            # OFF and UP both key up in the comb
+            lk1 = fm_gauss(comb, mu1, s1)
+            e = np.empty((len(comb), 3))
+            e[:, 0] = lk0 + fm_gauss(c, off_mu, off_sd)
+            e[:, 1] = lk0 + fm_gauss(c, up_mu, up_sd)
+            e[:, 2] = lk1 + fm_gauss(c, dn_mu, dn_sd)
+            path = fm_viterbi(e, fm_trans3(FM_SWITCH_P), self.prev)
+            mid = 0.5 * (mu0 + mu1)
+            down = 2
+        else:
+            mu0, mu1, s0, s1 = self.mu
+            x = self._features()
+            path = fm_viterbi(fm_loglik(x, mu0, s0, mu1, s1), fm_trans2(FM_SWITCH_P), self.prev)
+            mid = 0.5 * (mu0 + mu1)
+            down = 1
+        for i in range(n_commit):
+            center, env, _ = self.vit[i]
+            state = int(path[i])
+            on = state == down
+            self.trace.append((center, x[i], mid, nd, on, mu0, mu1))
+            self.prev = state
+            rec = self._step(center, env, on, total, now)
+            if rec is not None:
+                out.append(rec)
+        del self.vit[:n_commit]
+        return out
+
+    def _features(self):
+        """Level of each queued frame in dB, key down high: the comb level, or comb minus carrier."""
+        if FM_FEATURE == "diff":
+            return [10.0 * math.log10(env + 1e-30) - 10.0 * math.log10(aux + 1e-30)
+                    for _, env, aux in self.vit]
+        return [10.0 * math.log10(env + 1e-30) for _, env, _ in self.vit]
+
+    def _set_bands(self):
+        idx, wts = [], []
+        for k, w in zip(FM_KS, FM_W):
+            b = np.flatnonzero(np.abs(self.freqs - (self.fc + FM_TONE_HZ * k)) <= FM_SIDE_HALF_HZ)
+            idx.append(b)
+            wts.append(np.full(b.size, w))
+        self.band = np.concatenate(idx)
+        self.band_w = np.concatenate(wts)
+        self.cband = np.flatnonzero(np.abs(self.freqs - self.fc) <= FM_SIDE_HALF_HZ)
+
+    def _power(self, Pi):
+        return float(np.dot(Pi[self.band], self.band_w)) / self.wnorm
+
+    def _aux(self, Pi):
+        return float(np.sum(Pi[self.cband])) / self.wnorm
+
+
+FM_PLOT_PERIOD_S = 0.2                           # redraw interval of the FM level plot
+
+
+class FmLevelPlot(QtWidgets.QWidget):
+    """Window with the FM comb level against time for the last CW_TRACE_S seconds, the key threshold
+    with its hysteresis band, the key-up level, and a green mark at the bottom where key is down."""
+
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(QtCore.Qt.WindowType.Window)
+        self.setWindowTitle("FM level")
+        self.t_last = 0.0
+        self.plot = pg.PlotWidget()
+        self.plot.setLabel("bottom", "Time relative to newest sample", units="s")
+        self.plot.setLabel("left", "Comb level", units="dB (uncalibrated)")
+        self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.legend = self.plot.addLegend(brush=pg.mkBrush(0, 0, 0, 191))   # 75% black behind the legend
+        self.legend.setZValue(10)                  # drawn over the trace lines
+        self.lev = self.plot.plot(pen=pg.mkPen("c", width=1), name="comb level")
+        self.key = self.plot.plot(pen=pg.mkPen("g", width=3), name="key down")
+        self.thr = self.plot.plot(pen=pg.mkPen("y", width=1), name="midpoint")
+        self.thr_hi = self.plot.plot(pen=pg.mkPen("g", width=1, style=QtCore.Qt.PenStyle.DashLine),
+                                     name="key-down mean")
+        self.thr_lo = self.plot.plot(pen=pg.mkPen((160, 160, 160), width=1,
+                                                  style=QtCore.Qt.PenStyle.DashLine), name="key-up mean")
+        self.noise = self.plot.plot(pen=pg.mkPen((160, 160, 160), width=1,
+                                                 style=QtCore.Qt.PenStyle.DotLine), name="noise floor")
+        self.marks = []                               # (absolute sample, TextItem) for decoded characters
+        self.btn_save = QtWidgets.QPushButton("Save PNG")
+        self.btn_save.clicked.connect(self.save_png)
+        self.status = QtWidgets.QLabel("")
+        bar = QtWidgets.QHBoxLayout()
+        bar.addWidget(self.status, 1)
+        bar.addWidget(self.btn_save)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(self.plot, 1)
+        lay.addLayout(bar)
+        self.resize(900, 380)
+
+    def update_from(self, dec, total):
+        """Redraw from the decoder's trace, at most every FM_PLOT_PERIOD_S."""
+        now = time.monotonic()
+        if now - self.t_last < FM_PLOT_PERIOD_S or len(dec.trace) < 2:
+            return
+        self.t_last = now
+        a = np.asarray(dec.trace, dtype=np.float64)
+        t = (a[:, 0] - total) / dec.rate
+        lev, mid, noise, on = a[:, 1], a[:, 2], a[:, 3], a[:, 4] > 0.5
+        mu0, mu1 = a[:, 5], a[:, 6]
+        hi, lo = float(np.max(lev)), float(np.min(lev))
+        self.lev.setData(t, lev)
+        # key-down is a short horizontal mark just above the bottom edge; nothing is drawn when key is up
+        self.key.setData(t, np.where(on, lo - 1.9, np.nan), connect="finite")
+        self.thr.setData(t, mid)
+        self.thr_hi.setData(t, mu1)
+        self.thr_lo.setData(t, mu0)
+        self.noise.setData(t, noise)
+        self.plot.setXRange(-CW_TRACE_S, 0.0, padding=0.0)
+        self.plot.setYRange(lo - 2.0, hi + 2.0, padding=0.0)
+        y_txt = lo - 1.5                              # just above the key-down marks
+        kept = []
+        for ms, item, tx in self.marks:
+            x = (ms - total) / dec.rate
+            if x < -CW_TRACE_S - 0.5:
+                self.plot.removeItem(item)
+            else:
+                item.setPos(x, y_txt)
+                kept.append((ms, item, tx))
+        self.marks = kept
+        self.status.setText(f"key down {100.0 * np.mean(on):.0f}% of last {-t[0]:.0f} s, "
+                            f"midpoint {mid[-1]:.1f} dB, key-up {mu0[-1]:.1f} dB, "
+                            f"key-down {mu1[-1]:.1f} dB, noise floor {noise[-1]:.1f} dB")
+
+    def _add_mark(self, ms, ch, tx):
+        import html as _html
+        item = pg.TextItem(html=f'<span style="color:#7f7;font-size:12pt;font-weight:bold">'
+                                f'{_html.escape(ch)}</span>', anchor=(0.5, 1.0))
+        self.plot.addItem(item)
+        self.marks.append((ms, item, tx))
+
+    def add_char(self, ev):
+        """A character of a transmission still in progress, at its sample position."""
+        self._add_mark(ev["sample"], ev["ch"], ev["tx"])
+
+    def remove_tx(self, tx):
+        """Remove the characters of one transmission, when it is rejected or replaced."""
+        keep = []
+        for ms, item, t in self.marks:
+            if t == tx:
+                self.plot.removeItem(item)
+            else:
+                keep.append((ms, item, t))
+        self.marks = keep
+
+    def add_decode(self, rec, rate):
+        """Show the final characters of a decoded transmission in place of its streamed ones."""
+        self.remove_tx(rec["tx"])
+        for ch, t0, t1 in rec.get("char_t", []):
+            self._add_mark(rec["t_first"] + 0.5 * (t0 + t1) * rate, ch, rec["tx"])
+
+    def save_png(self):
+        import pyqtgraph.exporters
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path = os.path.abspath(f"fm_level_{stamp}.png")
+        exp = pyqtgraph.exporters.ImageExporter(self.plot.plotItem)
+        exp.parameters()["width"] = 1400
+        exp.export(path)
+        self.status.setText(f"Saved {os.path.basename(path)}")
 
 
 # ------------------------------------------------------------ WWV timing
@@ -2370,8 +2881,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wwv_on = False             # WWV timing mode: tuned to a WWV frequency, decoding off
         self.wwv = None                 # WwvMonitor while wwv_on
         self.cw_on = False              # CW decode mode: 3 kHz window, Morse decoding on
-        self.cw = None                  # CwDecoder while cw_on
+        self.cw = None                  # CwDecoder or FmDecoder while cw_on
+        self.fm_plot = None             # FmLevelPlot window, shown while in FM mode
+        self.cw_kind = "CW"             # "CW" or "FM": which decoder self.cw is
         self.cw_txt = os.path.join(os.path.dirname(os.path.abspath(all_txt)), "CW.TXT")
+        self.fm_txt = os.path.join(os.path.dirname(os.path.abspath(all_txt)), "FM.TXT")
         self.onset_log_on = False       # write the onset CSV (debugging); set from the WWV window
         self.wwv_mhz = WWV_DEFAULT_MHZ  # WWV frequency last chosen from the menu
         self.track_on = False           # Track mode: one line per transmission, logged to CSV
@@ -2470,10 +2984,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_calls.setCheckable(True)
         self.btn_calls.setChecked(True)                 # on by default, as Mark
         self.show_call = True
-        # mode menu: FT8, FT4, Off, and a WWV submenu (frequencies, timing window, capture)
+        # mode menu: FT8, FT4, CW, FM, Track, a WWV submenu (frequencies, timing window, capture), Off
         self.mode_menu = QtWidgets.QMenu(self)
         self.mode_actions = {}
-        for name in ("FT8", "FT4", "CW", "Track", "Off"):
+        for name in ("FT8", "FT4", "CW", "FM", "Track"):
             a = self.mode_menu.addAction(name)
             a.setCheckable(True)
             a.triggered.connect(lambda _=False, n=name: self._on_mode_action(n))
@@ -2493,6 +3007,10 @@ class MainWindow(QtWidgets.QMainWindow):
         a_win.triggered.connect(self.show_wwv_stats)
         a_cap = self.wwv_menu.addAction("Save 10 s capture")
         a_cap.triggered.connect(self._menu_save_capture)
+        a_off = self.mode_menu.addAction("Off")
+        a_off.setCheckable(True)
+        a_off.triggered.connect(lambda _=False: self._on_mode_action("Off"))
+        self.mode_actions["Off"] = a_off
         self.mode_btn = QtWidgets.QPushButton()
         self.mode_btn.setMenu(self.mode_menu)
         start = "FT8" if (decode_start and decode_ok) else "Off"
@@ -2703,8 +3221,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wf_plot.viewport().removeEventFilter(self)
 
     def closeEvent(self, ev):
+        self.save_settings()
         self._detach_filters()
         super().closeEvent(ev)
+
+    # ---- settings file: written on exit, read on start (load_settings and main)
+    def settings_dict(self):
+        if self.cw_on:
+            mode = self.cw_kind
+        elif self.wwv_on:
+            mode = "WWV"
+        elif self.track_on:
+            mode = "Track"
+        else:
+            mode = self.mode or "Off"
+        return {
+            "frequency_mhz": round(self.tune_hz / 1e6, 6),
+            "center_mhz": round((self.tune_hz + self.disp_off) / 1e6, 6),
+            "span_khz": round(self.span_hz / 1e3, 6),
+            "band": self.band_box.currentText(),
+            "mode": mode,
+            "wwv_mhz": self.wwv_mhz,
+            "peak_avg": self.blue_box.currentData(),
+            "raw_power": self.act_raw.isChecked(),
+            "time_average": self.act_avg.isChecked(),
+            "fft_size": self.an.nfft,
+        }
+
+    def save_settings(self):
+        path = os.path.join(os.getcwd(), SETTINGS_NAME)
+        try:
+            with open(path, "w") as f:
+                json.dump(self.settings_dict(), f, indent=2)
+        except Exception as e:
+            print(f"warning: cannot save {path} ({e})", file=sys.stderr)
+
+    def apply_settings(self, saved, decode_allowed):
+        """Restore the mode, peak/average and display settings. The saved window is kept: entering
+        a mode does not move the tuning."""
+        def get(key, typ):
+            v = saved.get(key)
+            return v if isinstance(v, typ) else None
+        self.manual_tuned = True
+        mode = get("mode", str)
+        if mode in ("FT8", "FT4") and not decode_allowed:
+            mode = "Off"
+        wwv = get("wwv_mhz", (int, float))
+        if mode == "WWV" and wwv is not None:
+            self._enter_wwv(float(wwv))
+        elif mode in ("CW", "FM", "Track", "FT8", "FT4", "Off"):
+            self._on_mode_action(mode)
+        peak = get("peak_avg", str)
+        if peak is not None and self.blue_box.findData(peak) >= 0:
+            self.blue_box.setCurrentIndex(self.blue_box.findData(peak))
+        raw = get("raw_power", bool)
+        if raw is not None:
+            self.act_raw.setChecked(raw)
+        avg = get("time_average", bool)
+        if avg is not None:
+            self.act_avg.setChecked(avg)
+        # Entering CW, FM or WWV sets its own narrow window, so the saved window is put back last
+        center, span = get("center_mhz", (int, float)), get("span_khz", (int, float))
+        if center is not None and span is not None and span > 0:
+            c_khz, half = float(center) * 1e3, float(span) / 2
+            self._tune_window(self.tune_hz / 1e6, c_khz - half, c_khz + half)
 
     def exit_app(self):
         self._detach_filters()
@@ -2829,8 +3409,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._leave_track()
         if self.wwv_on:
             self._leave_wwv()
-        if name == "CW":
-            self._enter_cw()
+        if name in ("CW", "FM"):
+            self._enter_cw(name)
             return
         mode = None if name == "Off" else name
         if self.cw_on:
@@ -3063,42 +3643,66 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_tracks(closed)
         self.tx_label.setText(f"Track: {self.trk_n} logged, {len(self.trk.active)} in progress")
 
-    # ---- CW mode: Morse decoder on the strongest keyed carrier in a 3 kHz window
-    def _enter_cw(self):
+    # ---- CW and FM modes: Morse decoder on a 3 kHz window. CW reads on/off keying of the carrier;
+    # FM reads keying of a 400 Hz FM tone from the sidebands of the carrier.
+    def _enter_cw(self, kind="CW"):
         if self.track_on:
             self._leave_track()
         if self.an.skip_tx:
             self.blue_box.setCurrentIndex(self.blue_box.findData("peak"))
         self._set_mode(None)
         self.cw_on = True
-        self.cw = CwDecoder(self.ring, self.rate)
-        self.decode_dock.setWindowTitle("CW decodes")
-        self.popout.setWindowTitle("CW decodes")
-        self._select_mode_box("CW")
+        self.cw_kind = kind
+        if kind == "FM":
+            if self.fm_plot is None:
+                self.fm_plot = FmLevelPlot()
+            self.fm_plot.show()
+        self.cw = (FmDecoder if kind == "FM" else CwDecoder)(self.ring, self.rate)
+        self.decode_dock.setWindowTitle(f"{kind} decodes")
+        self.popout.setWindowTitle(f"{kind} decodes")
+        self._select_mode_box(kind)
         khz = self.tune_hz / 1e3
         self._tune_window(self.tune_hz / 1e6, khz - CW_SPAN_KHZ / 2, khz + CW_SPAN_KHZ / 2)
         self.cw.set_window(self.tune_hz, self.disp_off - self.span_hz / 2,
                            self.disp_off + self.span_hz / 2)
         self.rate_label.setText("")
-        self.tx_label.setText("CW: listening")
+        self.tx_label.setText(f"{kind}: listening")
 
     def _leave_cw(self):
         self.cw_on = False
         self.cw = None
+        if self.fm_plot is not None:
+            self.fm_plot.hide()
         self.tx_label.setText("")
         self.decode_dock.setWindowTitle("Decodes")
         self.popout.setWindowTitle("Decodes")
         self._update_rate()
 
     def _on_cw(self, rec):
-        line = cw_line(rec)
-        self.decode_pane.append(line, False)
-        self.tx_label.setText(f"CW {rec['mhz']:.4f} MHz: {rec['text']}")
+        kind = rec.get("kind")
+        if kind == "char":                           # FM: a character complete while the transmission goes on
+            if self.cw_kind == "FM" and self.fm_plot is not None:
+                self.fm_plot.add_char(rec)
+            return
+        if kind == "drop":                           # the transmission was rejected: remove its characters
+            if self.fm_plot is not None:
+                self.fm_plot.remove_tx(rec["tx"])
+            return
+        if self.cw_kind == "FM":
+            lines, path, tag = fm_lines(rec), self.fm_txt, "FM"
+        else:
+            lines, path, tag = [cw_line(rec)], self.cw_txt, "CW"
+        for line in lines:
+            self.decode_pane.append(line, False)
+        if self.cw_kind == "FM" and self.fm_plot is not None:
+            self.fm_plot.add_decode(rec, self.cw.rate)
+        self.tx_label.setText(f"{tag} {rec['mhz']:.4f} MHz: {rec['text']}")
         try:
-            with open(self.cw_txt, "a") as f:
-                f.write(line + "\n")
+            with open(path, "a") as f:
+                for line in lines:
+                    f.write(line + "\n")
         except OSError as e:
-            self.tx_label.setText(f"CW.TXT write failed: {e}")
+            self.tx_label.setText(f"{tag}.TXT write failed: {e}")
 
     # ---- WWV timing mode: tuned to a WWV frequency with decoding off; separate from Tx Test
     def _enter_wwv(self, mhz):
@@ -3750,6 +4354,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cw_on and self.cw is not None:
             for rec in self.cw.process():
                 self._on_cw(rec)
+            if self.cw_kind == "FM" and self.fm_plot is not None and self.fm_plot.isVisible():
+                self.fm_plot.update_from(self.cw, self.ring.total)
         if self.an.skip_tx:
             self._update_tx_label()
             blk = int(time.time() // NOISE_REPORT_S)
@@ -3799,6 +4405,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
 # ------------------------------------------------------------ main
 
+SETTINGS_NAME = "airspy_live_settings.json"      # saved on exit and read on start, in the folder PNG images go to
+
+
+def load_settings():
+    """Settings saved by the last run, read from the working directory. {} if there is no usable file."""
+    path = os.path.join(os.getcwd(), SETTINGS_NAME)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"warning: ignoring {path} ({e})", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(f"warning: ignoring {path} (not a settings object)", file=sys.stderr)
+        return {}
+    return data
+
+
 def main():
     ap = argparse.ArgumentParser(description="Airspy HF+ live spectrum/waterfall with FT8 decoding")
     ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -3814,7 +4440,7 @@ def main():
     ap.add_argument("--hi", type=float, help="display upper edge, absolute kHz")
     ap.add_argument("--rate", type=int, default=None,
                     help=f"sample rate in S/s; must be one the device reports (default {DEFAULT_RATE})")
-    ap.add_argument("--nfft", type=int, default=DEFAULT_NFFT,
+    ap.add_argument("--nfft", type=int, default=None,
                     help=f"FFT size, power of 2 (default {DEFAULT_NFFT} resolves FT8 tones at 192 kS/s)")
     ap.add_argument("-g", "--agc", choices=["on", "off"], default="on")
     ap.add_argument("-l", "--agc-threshold", choices=["low", "high"], default="low")
@@ -3834,6 +4460,23 @@ def main():
                     help=f"directory for temporary decoder WAVs (default {shm_default})")
     ap.add_argument("--no-decode", action="store_true", help="start with FT8 decoding off")
     args = ap.parse_args()
+
+    # Saved frequency and window are used unless one was given on the command line; --nfft falls back
+    # to the saved size. Mode and display settings are applied once the window exists.
+    saved = load_settings()
+
+    def saved_num(key):
+        v = saved.get(key)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    window_given = any(v is not None for v in (args.freq, args.center, args.span, args.lo, args.hi))
+    if not window_given:
+        args.freq = saved_num("frequency_mhz")
+        args.center = saved_num("center_mhz")
+        args.span = saved_num("span_khz")
+    if args.nfft is None:
+        n = int(saved_num("fft_size") or 0)
+        args.nfft = n if n >= 256 and n & (n - 1) == 0 else DEFAULT_NFFT
 
     freq_given = args.freq is not None
     if args.freq is None:
@@ -3925,6 +4568,8 @@ def main():
                          decode_ok=decode_ok, decode_start=not args.no_decode,
                          vmin=args.vmin, vmax=args.vmax, compress=args.compress)
         win.show()
+        if saved:
+            win.apply_settings(saved, decode_ok and not args.no_decode)
         app.exec()
     finally:
         lib.airspyhf_stop(dev)
