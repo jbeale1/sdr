@@ -5,3 +5,5 @@ Later I got the AirSpy HF+ Discovery which has even better performance on shortw
 
 The "airspy_live.py" program displays a waterfall, can decode FT8, and also reads NIST WWV timecode and compares the local system clock offset with it.
 ![WWV_capture](WWV_cap.png)
+
+![FM decode window](FM-decode.png)
