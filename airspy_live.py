@@ -29,6 +29,7 @@ Examples:
     ./airspy_live.py --no-decode                  # display only
 """
 import argparse
+import bisect
 import csv
 import ctypes
 import ctypes.util
@@ -55,7 +56,7 @@ import scipy.special as sspec
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.34.0"
+VERSION = "0.43.0"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -204,6 +205,7 @@ class RingBuffer:
         self.buf = np.zeros(size, dtype=np.complex64)
         self.total = 0            # absolute number of samples written
         self.dropped = 0          # from the driver
+        self.pushes = deque(maxlen=50000)   # (total after the push, time.time() at the push)
         self.lock = threading.Lock()
 
     def push(self, x):
@@ -220,6 +222,7 @@ class RingBuffer:
             if n > first:
                 self.buf[:n - first] = x[first:]
             self.total += n
+            self.pushes.append((self.total, time.time()))
 
     def read(self, start, count):
         """Copy absolute range [start, start+count). Returns None if overwritten."""
@@ -233,6 +236,18 @@ class RingBuffer:
             if count > first:
                 out[first:] = self.buf[:count - first]
             return out
+
+    def wall_at(self, sample, rate):
+        """Wall-clock time (time.time()) at which absolute sample index `sample` reached the ring. The
+        last sample of each USB block arrived at that block's push time, and earlier samples are spaced at
+        the sample rate. None if the sample is newer than every push record."""
+        with self.lock:
+            recs = list(self.pushes)
+        i = bisect.bisect_left([r[0] for r in recs], sample)
+        if i >= len(recs):
+            return None
+        total_after, t_push = recs[i]
+        return t_push - (total_after - sample) / rate
 
 # ------------------------------------------------------------ USB callback
 
@@ -890,6 +905,8 @@ class CwDecoder:
     (uncalibrated); SNR is that above the key-up level."""
 
     STREAM_CHARS = False                             # True: characters are emitted as they complete
+    REJECT_FRAC = None                               # key-down elements further than this from ideal are dropped
+    TURNON_MASK_S = None                             # s after a carrier turns on in which no element is kept (strong signals)
     FFT_N = CW_N                                     # FFT length (a subclass may use another)
 
     def __init__(self, ring, rate):
@@ -940,6 +957,16 @@ class CwDecoder:
         self.tx_chars = 0                                # characters already emitted for it
         self.stream_unit = None                          # dit length from the last streamed estimate, s
         self.gap_fired = False                           # the open key-up gap has been checked for a character
+        self.tx_spec = None                              # key-down spectrum summed over the transmission (FM)
+        self.tx_spec_n = 0
+        self.aux_floor_db = None                         # 10th percentile of the carrier level, dB (turn-on mask)
+        self.carrier_on = None                           # centre sample of the carrier's turn-on, or None
+        self.carrier_peak = -math.inf                    # peak comb level in the turn-on window, dB
+        self.carrier_mask = None                         # mask length for this turn-on, s (0: none); None until decided
+        self.carrier_below = 0                           # frames in a row with the carrier below its level
+        self.pre_levels = []                             # comb levels in the carrier-only preamble (strong signals)
+        self.pre_done = False                            # the preamble has ended
+        self.last_turnon = None                          # (turn-on centre, mask s) of the last decided turn-on
 
     def process(self, now=None):
         """Measure new frames and return the transmissions that ended since the last call."""
@@ -980,7 +1007,7 @@ class CwDecoder:
             self.avg += self.a_avg * (Pi - self.avg)
         if self.fc is None or self.frame_n % CW_RESEL_FRAMES == 0:   # a carrier that appears is picked up within a few frames
             idx = int(np.argmax(np.where(self.win_mask, self.avg, -np.inf)))
-            self.fc = float(self.freqs[idx])
+            self.fc = self._refine_peak(idx)
             self._set_bands()
         self.sm.append(self._power(Pi))
         env = sum(self.sm) / len(self.sm)
@@ -991,9 +1018,68 @@ class CwDecoder:
         aux_db = 10.0 * math.log10(aux + 1e-30)
         self.aux_recent.append(aux_db)
         self.aux_hist.append(aux_db)
+        if self.TURNON_MASK_S is not None:
+            self._track_carrier(center, lev, aux_db)
         if self.frame_n % 20 == 0 and len(self.hist) >= 200:
             self._fit_levels()
         self.queue.append((center, env, aux))
+
+    def _track_carrier(self, center, lev, aux_db):
+        """Turn-on mask (FM only). The turn-on starts at the first frame whose carrier level is FM_CARRIER_ON_DB
+        above its floor. Once the window has passed, its peak comb level decides the mask for that turn-on."""
+        if self.aux_floor_db is None:
+            return
+        above = aux_db > self.aux_floor_db + FM_CARRIER_ON_DB
+        if self.carrier_on is None:
+            if above:
+                self.carrier_on = center
+                self.carrier_peak = lev
+                self.carrier_mask = None
+                self.carrier_below = 0
+                self.pre_levels, self.pre_done = [], False
+            return
+        if not above:
+            self.carrier_below += 1
+            if self.carrier_below * self.hop / self.rate >= FM_CARRIER_OFF_S:
+                self.carrier_on, self.carrier_mask, self.carrier_below = None, None, 0
+                self.pre_levels, self.pre_done = [], False
+            return
+        self.carrier_below = 0
+        self._track_preamble(center, lev)
+        if self.carrier_mask is not None:
+            return
+        if center < self.carrier_on + self.TURNON_MASK_S * self.rate:
+            self.carrier_peak = max(self.carrier_peak, lev)
+        elif self.noise_db is not None:
+            self._decide_carrier_mask()
+
+    def _track_preamble(self, center, lev):
+        """Carrier-only comb level after the turn-on window and before the first key down. For a strong
+        signal this is the key-up level, which the noise-only history cannot give."""
+        if self.pre_done or center < self.carrier_on + self.TURNON_MASK_S * self.rate:
+            return
+        if len(self.pre_levels) >= FM_PRE_MIN_FRAMES:
+            if lev > float(np.median(self.pre_levels)) + FM_PRE_JUMP_DB:
+                self.pre_done = True
+                return
+        self.pre_levels.append(lev)
+        if len(self.pre_levels) >= FM_PRE_MAX_FRAMES:
+            self.pre_done = True
+
+    def _preamble(self):
+        """(median, sd) in dB of the carrier-only preamble, if the signal is strong, else None."""
+        if self.carrier_on is None or self.noise_db is None or len(self.pre_levels) < FM_PRE_MIN_FRAMES:
+            return None
+        p = np.asarray(self.pre_levels, dtype=np.float64)
+        p0 = float(np.median(p))
+        if p0 - self.noise_db < FM_TURNON_MASK_DB:
+            return None
+        return p0, max(float(p.std()), 0.5)
+
+    def _decide_carrier_mask(self):
+        strong = self.noise_db is not None and self.carrier_peak - self.noise_db >= FM_TURNON_MASK_DB
+        self.carrier_mask = self.TURNON_MASK_S if strong else 0.0
+        self.last_turnon = (self.carrier_on, self.carrier_mask)
 
     def _fit_levels(self):
         """Key-up level (10th percentile of 30 s) and key-down threshold (halfway from there to the
@@ -1002,6 +1088,22 @@ class CwDecoder:
         hi = float(np.percentile(np.asarray(self.recent), 90))
         self.noise_db = lo
         self.thr = lo + 0.5 * max(hi - lo, 2.0 * CW_MIN_SEP_DB)
+
+    def _carrier_fine(self):
+        """Carrier offset from tuning used for the transmission's frequency. The base decoder has
+        only the peak bin, refined in _refine_peak."""
+        return self.fc
+
+    def _refine_peak(self, k):
+        """Carrier offset from tuning, Hz: the peak bin of the averaged spectrum, refined to a fraction
+        of a bin by a parabola through the dB values of that bin and its two neighbours."""
+        if 0 < k < self.nfft - 1:
+            y = 10.0 * np.log10(self.avg[k - 1:k + 2] + 1e-30)
+            den = float(y[0] - 2.0 * y[1] + y[2])
+            if den < 0.0:
+                df = float(self.freqs[k + 1] - self.freqs[k])
+                return float(self.freqs[k]) + 0.5 * float(y[0] - y[2]) / den * df
+        return float(self.freqs[k])
 
     def _set_bands(self):
         """Bins that make up the level, for the current carrier."""
@@ -1040,13 +1142,41 @@ class CwDecoder:
             segs.pop(0)
         return segs, t_first
 
+    def _turnon(self, segs, t_first, final):
+        """Apply the turn-on mask (TURNON_MASK_S, FM only). The window runs from the carrier's turn-on; elements
+        that start in it are removed when the turn-on was strong. The anchor is kept after the carrier drops, so
+        the final decode of a transmission uses the same mask as its streamed characters. While the mask is
+        undecided, returns None and the caller waits (streaming). Returns (segs, t_first, masked)."""
+        if self.TURNON_MASK_S is None:
+            return segs, t_first, []
+        if self.carrier_on is not None:
+            if self.carrier_mask is None:
+                if not final:
+                    return None
+                self._decide_carrier_mask()
+            anchor = (self.carrier_on, self.carrier_mask)
+        else:
+            anchor = self.last_turnon
+        if anchor is None or anchor[1] <= 0.0:
+            return segs, t_first, []
+        on, mask = anchor
+        first_s = max(0.0, (t_first - on) / self.rate)
+        segs, lead, masked = cw_mask_turnon(segs, mask, first_s)
+        return segs, t_first + lead * self.rate, masked
+
     def _stream(self, open_s=0.0):
         """Emit the characters of the current transmission that are complete (STREAM_CHARS only). A
         character is complete once a key-up gap of two dits or more follows it. The dit length is
         re-estimated from the transmission so far, so an early character can still change at the end."""
         segs, t_first = self._closed_segs(self.closed, open_s)
+        if t_first is None:
+            return
+        held = self._turnon(segs, t_first, final=False)
+        if held is None:
+            return
+        segs, t_first, _ = held
         ons = [d for on, d in segs if on]
-        if t_first is None or not ons:
+        if not ons:
             return
         offs = [d for on, d in segs if not on]
         unit = cw_estimate_unit(ons, offs)
@@ -1108,12 +1238,22 @@ class CwDecoder:
                 self.events.append({"kind": "drop", "tx": self.tx_id})
         self.closed = []
         self.tx_id, self.tx_chars, self.stream_unit = None, 0, None
+        self.tx_spec, self.tx_spec_n = None, 0
         return rec
+
+    def _wall_of(self, t_sample, total, now):
+        """Wall-clock time of an absolute sample: from the USB push that delivered it, when the ring has
+        push records, otherwise from the time of this call."""
+        w = self.ring.wall_at(t_sample, self.rate) if hasattr(self.ring, "wall_at") else None
+        return w if w is not None else now - (total - t_sample) / self.rate
 
     def _finish(self, total, now):
         segs, t_first = self._closed_segs(self.closed)
         while segs and not segs[-1][0]:
             segs.pop()
+        if t_first is None:
+            return None
+        segs, t_first, masked = self._turnon(segs, t_first, final=True)
         on_pow, on_n = 0.0, 0
         for on, n, _, pw in self.closed:
             if on and n * self.hop / self.rate >= CW_MIN_ON_S:
@@ -1124,12 +1264,22 @@ class CwDecoder:
             return None
         offs = [d for on, d in segs if not on]
         unit = cw_estimate_unit(ons, offs)
+        c = 0.0
+        for _ in range(3):                           # classes depend on the unit, and the unit on the classes
+            c, unit = cw_fit_timing(segs, unit)
+        dropped = []
+        if self.REJECT_FRAC is not None:
+            segs, lead, dropped = cw_drop_outliers(segs, unit, self.REJECT_FRAC)
+            if dropped:
+                t_first += lead * self.rate          # the first element is now the first one kept
+                for _ in range(3):
+                    c, unit = cw_fit_timing(segs, unit)
         text, n_chars = cw_decode(segs, unit)
         if n_chars < CW_MIN_CHARS:
             return None
         raw = 10.0 * math.log10(on_pow / on_n + 1e-30)
-        return {"wall": now - (total - t_first) / self.rate,
-                "mhz": (self.tune_hz + self.fc) / 1e6,
+        return {"wall": self._wall_of(t_first, total, now) + c,
+                "mhz": (self.tune_hz + self._carrier_fine()) / 1e6,
                 "wpm": 1.2 / unit,
                 "text": text,
                 "raw": raw,
@@ -1139,7 +1289,8 @@ class CwDecoder:
                 "segs": segs,
                 "t_first": t_first,
                 "char_t": cw_char_times(segs, unit),
-                "kind": "tx", "tx": self.tx_id}
+                "kind": "tx", "tx": self.tx_id,
+                "dropped": dropped, "masked": masked}
 
 
 # ---- FM keyed-tone decoder: Morse sent as a 400 Hz FM tone, read from the carrier's sidebands
@@ -1159,6 +1310,16 @@ FM_FEATURE = "carrier3"                           # "carrier3": OFF/UP/DOWN stat
 FM_MIN_SEP_DB = 4.0                             # least key-down/key-up separation accepted by the level fit
 FM_HOLD_FRAMES = int(10.0 / CW_HOP_S)           # frames held (up to 10 s) until the levels exist
 FM_SMOOTH_FRAMES = 1                             # frames averaged before the level; 1 keeps the edges sharp
+FM_REJECT_FRAC = 0.2                             # a key-down element this far from its ideal length (dit 1, dah 3 units) is noise
+FM_TURNON_MASK_S = 0.25                         # no element is kept this long after a carrier turns on (turn-on chirp)
+FM_TURNON_MASK_DB = 20.0                        # the mask applies only if the peak comb level in that window is this far above key up
+FM_CARRIER_ON_DB = 10.0                         # carrier is on when its band level is this far above its 10th-percentile floor
+FM_CARRIER_OFF_S = 0.2                          # carrier is off after this long below that level
+FM_PRE_FLOOR_DB = 10.0                          # strong signal: fit only levels this far above the noise (drops pre-carrier noise)
+FM_PRE_JUMP_DB = 10.0                           # the carrier-only preamble ends when the comb rises this far above its median
+FM_PRE_MIN_FRAMES = 20                          # preamble frames needed before it is used (0.1 s)
+FM_PRE_MAX_FRAMES = 400                         # preamble frames kept at most (2 s)
+FM_PRE_BOOT_DB = 10.0                           # before any key down: threshold this far above the preamble
 
 
 def cw_char_times(segs, unit, final=True):
@@ -1180,6 +1341,88 @@ def cw_char_times(segs, unit, final=True):
     if final and sym:
         out.append((CW_TEXT.get(sym, "#"), t0, t1))
     return out
+
+
+def cw_mask_turnon(segs, mask_s, first_s=0.0):
+    """Remove the key-down elements that start within mask_s of the carrier's turn-on: the turn-on chirp of
+    a strong carrier. first_s is the time from the turn-on to the first element in segs. Each removed element
+    becomes key up, and neighbouring key-up runs merge. Leading key up is stripped. Returns (segs, lead,
+    masked): lead is the time removed from the start, and masked lists the removed lengths in seconds."""
+    start, flags = first_s, []
+    for on, d in segs:
+        flags.append(bool(on) and start < mask_s)
+        start += d
+    masked = [d for (_, d), m in zip(segs, flags) if m]
+    out = []
+    for (on, d), m in zip(segs, flags):
+        on = bool(on) and not m
+        if out and out[-1][0] == on:
+            out[-1][1] += d
+        else:
+            out.append([on, d])
+    lead = 0.0
+    while out and not out[0][0]:
+        lead += out[0][1]
+        out.pop(0)
+    return out, lead, masked
+
+
+def cw_drop_outliers(segs, unit, frac):
+    """Remove key-down elements whose length is more than frac away from ideal (dit 1 unit, dah 3 units).
+    The key-up runs either side of a removed element become one run. Leading key-up is stripped, and its
+    time, with the removed leading elements, is returned as lead. Returns (segs, lead, dropped), where
+    dropped lists the lengths in seconds of the removed elements."""
+    segs = [[on, d] for on, d in segs]
+    lead, dropped = 0.0, []
+    while True:
+        bad = None
+        for i, (on, d) in enumerate(segs):
+            if on:
+                ideal = 1.0 if d / unit < 2 else 3.0
+                if abs(d / unit - ideal) > frac * ideal:
+                    bad = i
+                    break
+        if bad is None:
+            break
+        dropped.append(segs[bad][1])
+        if bad == 0:
+            lead += segs[0][1]
+            del segs[0]
+        elif bad + 1 < len(segs):
+            segs[bad - 1][1] += segs[bad + 1][1]
+            del segs[bad:bad + 2]
+        else:
+            del segs[bad]
+        while segs and not segs[0][0]:
+            lead += segs[0][1]
+            del segs[0]
+    return segs, lead, dropped
+
+
+def cw_fit_timing(segs, unit):
+    """Least-squares fit of a transmission's start time and dit length to a perfect keyer. Each run is
+    classed at the given unit (key down: dit or dah; key up: within a character, letter gap or word
+    gap), and its ideal length is 1, 3, 1, 3 or 7 units. The start of each run, measured from the start
+    of segs, is fitted as c + unit * S, where S is its ideal start in units. Returns (c, unit): c is the
+    offset in seconds of the fitted start from the start of segs."""
+    if len(segs) < 3:
+        return 0.0, unit
+    measured = np.concatenate([[0.0], np.cumsum([d for _, d in segs])[:-1]])
+    ideal = []
+    for on, d in segs:
+        r = d / unit
+        if on:
+            ideal.append(1.0 if r < 2 else 3.0)
+        elif r < 2:
+            ideal.append(1.0)
+        elif r < 5:
+            ideal.append(3.0)
+        else:
+            ideal.append(7.0)
+    S = np.concatenate([[0.0], np.cumsum(ideal)[:-1]])
+    A = np.column_stack([np.ones(len(S)), S])
+    (c, u), _, _, _ = np.linalg.lstsq(A, measured, rcond=None)
+    return float(c), float(u)
 
 
 def cw_timing(segs, unit):
@@ -1221,9 +1464,9 @@ def cw_timing(segs, unit):
 
 
 def fm_lines(rec):
-    """Two log lines for an FM transmission: the decode with timing summary, then the boundary
-    margin of each character."""
-    stamp = time.strftime("%H:%M:%S", time.gmtime(rec["wall"]))
+    """One log line for an FM transmission: date and time to the millisecond, the decode, the timing
+    summary, then the closest boundary margin of each character as data (ms)."""
+    stamp = datetime.fromtimestamp(rec["wall"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     chars, on_dev, off_dev = cw_timing(rec["segs"], rec["unit"])
 
     def rms(v):
@@ -1231,12 +1474,16 @@ def fm_lines(rec):
 
     ms = [m for _, m in chars if m is not None]
     closest = min(ms) if ms else float("nan")
-    head = (f"{stamp} UTC  {rec['mhz']:.4f} MHz  FM {rec['wpm']:.1f} wpm  {rec['text']}  "
+    per_char = "  ".join(ch if m is None else f"{ch}:{m:.0f}" for ch, m in chars)
+    if rec.get("masked"):
+        per_char += "  masked " + ", ".join(f"{d * 1e3:.0f} ms" for d in rec["masked"])
+    if rec.get("dropped"):
+        per_char += "  dropped " + ", ".join(f"{d * 1e3:.0f} ms" for d in rec["dropped"])
+    line = (f"{stamp} UTC  {rec['mhz']:.6f} MHz  FM {rec['wpm']:.1f} wpm  {rec['text']}  "
             f"raw {rec['raw']:+.1f} dB  SNR {rec['snr']:+.1f} dB  {rec['dur']:.1f} s  "
-            f"timing on +/-{rms(on_dev):.0f}% gap +/-{rms(off_dev):.0f}%  closest {closest:.0f} ms")
-    detail = "    closest call per character, ms to boundary: " + "  ".join(
-        ch if m is None else f"{ch} {m:.0f}" for ch, m in chars)
-    return [head, detail]
+            f"timing on +/-{rms(on_dev):.0f}% gap +/-{rms(off_dev):.0f}%  closest {closest:.0f} ms  "
+            f"{per_char}")
+    return [line]
 
 
 def fm_gauss(x, mu, s):
@@ -1293,6 +1540,8 @@ class FmDecoder(CwDecoder):
     and Morse decoding are shared with CwDecoder."""
 
     STREAM_CHARS = True
+    REJECT_FRAC = FM_REJECT_FRAC
+    TURNON_MASK_S = FM_TURNON_MASK_S
     FFT_N = FM_N
 
     def reset(self):
@@ -1302,8 +1551,12 @@ class FmDecoder(CwDecoder):
         self.vit = []            # (centre, linear power) frames not yet committed
         self.prev = 0            # state of the last committed frame
         self.aux_mu = None       # carrier dB: (OFF mean, OFF sd, UP mean, UP sd, DOWN mean, DOWN sd) or None
+        self.spec_q = {}         # frame centre -> (first bin, spectrum slice), until the frame is committed
+        self.spec_half = int(FM_SPEC_HALF_HZ / float(self.freqs[1] - self.freqs[0]))
 
     def _fit_levels(self):
+        if len(self.aux_hist) >= 200:
+            self.aux_floor_db = float(np.percentile(np.asarray(self.aux_hist), 10))
         if FM_SEGMENTER == "hysteresis":
             super()._fit_levels()
             self.mu = None
@@ -1312,20 +1565,31 @@ class FmDecoder(CwDecoder):
         r = np.asarray(self.recent, dtype=np.float64)
         if FM_FEATURE == "diff":                     # key down is high: comb minus carrier
             r = r - np.asarray(self.aux_recent, dtype=np.float64)
-        m0, m1 = np.percentile(r, [10.0, 90.0])
-        for _ in range(10):                          # 1-D two-means on the last 3 s of levels
-            low = np.abs(r - m0) <= np.abs(r - m1)
-            if not low.any() or low.all():
+        pre = self._preamble()                       # strong signal: carrier-only level, sd, or None
+        rf = r if pre is None else r[r > self.noise_db + FM_PRE_FLOOR_DB]
+        if rf.size < 20:
+            rf = r
+        m0, m1 = np.percentile(rf, [10.0, 90.0])
+        for _ in range(10):                          # 1-D two-means on the last 3 s of levels above the noise
+            low_f = np.abs(rf - m0) <= np.abs(rf - m1)
+            if not low_f.any() or low_f.all():
                 break
-            n0, n1 = float(r[low].mean()), float(r[~low].mean())
+            n0, n1 = float(rf[low_f].mean()), float(rf[~low_f].mean())
             if n0 == m0 and n1 == m1:
                 break
             m0, m1 = n0, n1
-        low = np.abs(r - m0) <= np.abs(r - m1)
-        if not low.any() or low.all() or m1 - m0 < FM_MIN_SEP_DB or (~low).mean() < 0.05:
-            return                                   # no keying in this window: keep the last valid levels
-        s0 = max(float(r[low].std()), 0.5)
-        s1 = max(float(r[~low].std()), 0.5)
+        low_f = np.abs(rf - m0) <= np.abs(rf - m1)
+        if not low_f.any() or low_f.all() or m1 - m0 < FM_MIN_SEP_DB or (~low_f).mean() < 0.05:
+            if pre is None:
+                return                               # no keying in this window: keep the last valid levels
+            p0, p_sd = pre                           # strong, no key down yet: key up at the preamble level
+            self.mu = (p0, p0 + 2.0 * FM_PRE_BOOT_DB, p_sd, max(p_sd, 3.0))
+            self.thr = p0 + FM_PRE_BOOT_DB
+            self.aux_mu = None
+            return
+        low = np.abs(r - m0) <= np.abs(r - m1)       # full window, for the carrier classes below
+        s0 = max(float(rf[low_f].std()), 0.5)
+        s1 = max(float(rf[~low_f].std()), 0.5)
         self.mu = (m0, m1, s0, s1)
         self.thr = 0.5 * (m0 + m1)
         self.aux_mu = None
@@ -1398,6 +1662,8 @@ class FmDecoder(CwDecoder):
             center, env, _ = self.vit[i]
             state = int(path[i])
             on = state == down
+            if on:
+                self._add_spec(center)
             self.trace.append((center, x[i], mid, nd, on, mu0, mu1))
             self.prev = state
             rec = self._step(center, env, on, total, now)
@@ -1412,6 +1678,29 @@ class FmDecoder(CwDecoder):
             return [10.0 * math.log10(env + 1e-30) - 10.0 * math.log10(aux + 1e-30)
                     for _, env, aux in self.vit]
         return [10.0 * math.log10(env + 1e-30) for _, env, _ in self.vit]
+
+    def _frame(self, Pi, center):
+        super()._frame(Pi, center)
+        k0 = int(np.argmin(np.abs(self.freqs - self.fc)))
+        lo, hi = max(0, k0 - self.spec_half), min(self.nfft, k0 + self.spec_half + 1)
+        self.spec_q[center] = (lo, Pi[lo:hi].astype(np.float64))
+
+    def _add_spec(self, center):
+        """Add a key-down frame's spectrum slice to the transmission's key-down average."""
+        e = self.spec_q.pop(center, None)
+        if e is None:
+            return
+        lo, sl = e
+        if self.tx_spec is None:
+            self.tx_spec = np.zeros(self.nfft)
+        self.tx_spec[lo:lo + sl.size] += sl
+        self.tx_spec_n += 1
+
+    def _carrier_fine(self):
+        if self.tx_spec is None or self.tx_spec_n < 20:
+            return self.fc
+        fine = fm_fine_carrier(self.tx_spec / self.tx_spec_n, self.fc, self.freqs)
+        return self.fc if fine is None else fine
 
     def _set_bands(self):
         idx, wts = [], []
@@ -1428,6 +1717,42 @@ class FmDecoder(CwDecoder):
 
     def _aux(self, Pi):
         return float(np.sum(Pi[self.cband])) / self.wnorm
+
+
+FM_PEAK_SEARCH_HZ = 120.0                        # a sideband peak is searched this far either side of fc +/- 400 Hz x k
+FM_SPEC_HALF_HZ = 3300.0                         # spectrum kept per frame, this far either side of the carrier
+
+
+def fm_fine_carrier(P, fc, freqs):
+    """Carrier offset from tuning, Hz, from the sideband lines of a key-down average spectrum P. The
+    lines sit at fc +/- 400 Hz x k, so the midpoint of each symmetric pair estimates fc whatever the tone
+    frequency. Each peak is refined by a parabola in dB, and the pair midpoints are averaged with weight
+    of the weaker line's power. Returns None if no pair was found."""
+    df = float(freqs[1] - freqs[0])
+    est, wts = [], []
+    for k in FM_KS:
+        if k <= 0:
+            continue
+        found = []
+        for sgn in (1, -1):
+            c = fc + sgn * FM_TONE_HZ * k
+            idx = np.flatnonzero(np.abs(freqs - c) <= FM_PEAK_SEARCH_HZ)
+            if idx.size < 3:
+                break
+            j = int(idx[int(np.argmax(P[idx]))])
+            if j <= 0 or j >= P.size - 1:
+                break
+            y0, y1, y2 = 10.0 * np.log10(P[j - 1:j + 2] + 1e-30)
+            den = float(y0 - 2.0 * y1 + y2)
+            if den >= 0.0:
+                break
+            found.append((float(freqs[j]) + 0.5 * float(y0 - y2) / den * df, float(P[j])))
+        if len(found) == 2:
+            est.append(0.5 * (found[0][0] + found[1][0]))
+            wts.append(min(found[0][1], found[1][1]))
+    if not est:
+        return None
+    return float(np.average(est, weights=wts))
 
 
 FM_PLOT_PERIOD_S = 0.2                           # redraw interval of the FM level plot
@@ -4578,3 +4903,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
