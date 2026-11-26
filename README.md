@@ -7,3 +7,6 @@ The "airspy_live.py" program displays a waterfall, can decode FT8, and also read
 ![WWV_capture](WWV_cap.png)
 
 ![FM decode window](FM-decode.png)
+
+An iq_waterfall program displays spectrum vs time from recorded IQ files.
+![test_packet_from_IQ](data_sequence.png)
