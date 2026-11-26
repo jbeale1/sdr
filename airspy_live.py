@@ -21,7 +21,7 @@ to the decodes pane and to track_YYYYmmdd_HHMMSS.csv in the current directory.
 The Settings menu holds raw/SNR display, time average and the FFT size. Changing the FFT
 size takes effect at once; the waterfall and background average start again.
 
--J.Beale N8JUF  23-Nov-2026
+-J.Beale N8JUF  25-Nov-2026
 
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
@@ -40,6 +40,7 @@ import os
 import math
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import sys
@@ -2628,6 +2629,241 @@ class DecodeBridge(QtCore.QObject):
     done = QtCore.Signal()
     count = QtCore.Signal(object)   # valid decodes in one slot: {"s0", "mode", "n"}
 
+# ---- IQ recorder: triggered raw capture of the displayed span, written as a WAV file
+
+IQ_NFFT = 4096                  # trigger statistic FFT: 47 Hz bins at 192 kS/s
+IQ_AVG_S = 0.03                 # power is averaged over this before the statistic; short, so the stop is not delayed
+IQ_WARM_S = 1.0                 # no triggering until the averages have settled
+IQ_FLOOR_TAU_S = 10.0           # background level follows slow changes over about this time
+IQ_ON_DB = 10.0                 # a peak this far above the background starts a recording
+IQ_OFF_DB = 4.0                 # below this the span counts as background again
+IQ_ON_MIN_S = 0.05              # the peak must stay above IQ_ON_DB this long
+IQ_PRE_S = 0.5                  # written before the carrier first rises above the background
+IQ_POST_S = 1.0                 # written after the span returns to background
+IQ_MAX_S = 120.0                # longest single recording
+
+
+def iq_utc(t, iso=False):
+    d = datetime.fromtimestamp(t, timezone.utc)
+    return d.isoformat(timespec="milliseconds") if iso else d.strftime("%H:%M:%S")
+
+
+def wav_float_header(rate, data_bytes):
+    """44-byte WAV header: 2 channels (I, Q), 32-bit IEEE float, interleaved."""
+    return struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + data_bytes, b"WAVE", b"fmt ",
+                       16, 3, 2, rate, rate * 8, 8, 32, b"data", data_bytes)
+
+
+class IqRecorder:
+    """Triggered IQ capture of the displayed span, wherever the receiver is tuned. Every new block of
+    samples goes into a pre-roll ring. Per FFT frame, the statistic is the strongest bin in the span,
+    relative to the span's median, after averaging. A recording starts when the statistic rises
+    IQ_ON_DB above a slowly tracked background, beginning IQ_PRE_S before the rise. It ends IQ_POST_S
+    after the statistic falls back within IQ_OFF_DB of the background, or at IQ_MAX_S.
+    Output: WAV (left = I, right = Q, receiver sample rate) and a JSON sidecar."""
+
+    def __init__(self, ring, rate, outdir):
+        self.ring = ring
+        self.rate = rate
+        self.outdir = outdir
+        self.nfft = IQ_NFFT
+        self.hop = IQ_NFFT // 2
+        self.win = np.hanning(self.nfft).astype(np.float32)
+        self.freqs = np.fft.fftshift(np.fft.fftfreq(self.nfft, 1.0 / rate))
+        self.alpha = min(1.0, (self.hop / rate) / IQ_AVG_S)
+        self.pre_n = int(IQ_PRE_S * rate)
+        self.pre_size = self.pre_n + int(3.0 * rate) + self.nfft
+        self.mask = None
+        self.tune_hz = 0
+        self.lo_off = self.hi_off = 0.0
+        self.rec = None
+        self.restart("recorder started")
+
+    def retarget(self, tune_hz, lo_off, hi_off):
+        """New tuning or displayed span: the statistic is taken over the new span from scratch."""
+        self.tune_hz = int(tune_hz)
+        self.lo_off, self.hi_off = lo_off, hi_off
+        self.mask = (self.freqs >= lo_off) & (self.freqs <= hi_off)
+        return self.restart("tuning or span changed")
+
+    def close(self):
+        return self.restart("recorder off")
+
+    def restart(self, reason):
+        """Forget the background and the pre-roll. A recording in progress is closed; returns its log lines."""
+        lines = self._finish(reason) if self.rec is not None else []
+        self.pos = None
+        self.base = 0
+        self.pre = RingBuffer(self.pre_size)
+        self.ema = None
+        self.s_floor = None
+        self.n_floor = 0
+        self.n_frames = 0
+        self.on_start = None
+        self.on_run = 0
+        self.stop_abs = None
+        self.rearm = False
+        return lines
+
+    def process(self, now=None):
+        """Read new samples, update the statistic and the recording. Returns log lines."""
+        ring, n, hop = self.ring, self.nfft, self.hop
+        out = []
+        if self.mask is None or not self.mask.any() or ring.total < n:
+            return out
+        now = time.time() if now is None else now
+        total = ring.total
+        if self.pos is None or total - self.pos > ring.size - n:
+            out += self.restart("samples lost")
+            self.pos = total - n
+            self.base = self.pos
+        avail = total - self.pos
+        if avail < n:
+            return out
+        k = min((avail - n) // hop + 1, 200)
+        seg = ring.read(self.pos, (k - 1) * hop + n)
+        if seg is None:
+            return out + self.restart("samples overwritten")
+        base_abs = self.pos
+        self.pos += k * hop
+        self.pre.push(seg[:k * hop])
+        frames = np.lib.stride_tricks.sliding_window_view(seg, n)[::hop] * self.win
+        X = np.fft.fftshift(np.fft.fft(frames, axis=1), axes=1)[:, self.mask]
+        P = X.real * X.real + X.imag * X.imag
+        for i in range(k):
+            self._frame(P[i], base_abs + i * hop + n // 2, now, out)
+        out += self._writes()
+        return out
+
+    def _frame(self, Pi, fc, now, out):
+        """One FFT frame: update the averaged spectrum, the statistic and the start and stop decisions.
+        fc is the frame centre as a ring sample index."""
+        if self.ema is None:
+            self.ema = Pi.astype(np.float64)
+        else:
+            self.ema += self.alpha * (Pi - self.ema)
+        self.n_frames += 1
+        e = 10.0 * np.log10(self.ema + 1e-30)
+        S = float(e.max() - np.median(e))
+        if self.s_floor is None:
+            self.s_floor = S
+        excess = S - self.s_floor
+        if self.rec is not None:
+            if excess < IQ_OFF_DB:
+                if self.stop_abs is None:
+                    self.stop_abs = fc + int(IQ_POST_S * self.rate)
+            else:
+                self.stop_abs = None
+            return
+        if self.n_frames * self.hop < IQ_WARM_S * self.rate:
+            self._track_floor(S)
+            return
+        if self.rearm and excess < IQ_OFF_DB:
+            self.rearm = False
+        if self.rearm or excess <= IQ_ON_DB:
+            self.on_start, self.on_run = None, 0
+            if excess < IQ_OFF_DB:
+                self._track_floor(S)
+            return
+        if self.on_start is None:
+            self.on_start = fc
+        self.on_run += self.hop
+        if self.on_run >= IQ_ON_MIN_S * self.rate:
+            self._open(self.on_start, now, out)
+            self.on_start, self.on_run = None, 0
+
+    def _track_floor(self, S):
+        self.n_floor += 1
+        a = max((self.hop / self.rate) / IQ_FLOOR_TAU_S, 1.0 / self.n_floor)
+        self.s_floor += a * (S - self.s_floor)
+
+    def _wall(self, idx, now):
+        w = self.ring.wall_at(idx, self.rate)
+        return w if w is not None else now - (self.pos - idx) / self.rate
+
+    def _open(self, onset, now, out):
+        """Start a recording with its pre-roll: IQ_PRE_S before the onset, as far as the buffer holds it."""
+        oldest = self.base + max(0, self.pre.total - self.pre.size)
+        start = max(onset - self.pre_n, oldest)
+        t_start = self._wall(start, now)
+        t_on = self._wall(onset, now)
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime(t_start))
+        base = os.path.join(self.outdir, f"iq_{stamp}_{self.tune_hz / 1e3:.0f}kHz")
+        path = base + ".wav"
+        f = open(path, "wb")
+        f.write(wav_float_header(self.rate, 0))
+        self.rec = {"f": f, "path": path, "base": base, "wpos": start, "n": 0, "lost": 0,
+                    "t_start": t_start, "t_onset": t_on}
+        out.append(f"{iq_utc(t_start)} UTC  IQ recording started  {self.tune_hz / 1e6:.4f} MHz  "
+                   f"carrier at {iq_utc(t_on)}  -> {os.path.basename(path)}")
+
+    def _writes(self):
+        """Write the samples due so far: up to the newest sample, or to the stop point. Returns log lines."""
+        rec = self.rec
+        if rec is None:
+            return []
+        max_n = int(IQ_MAX_S * self.rate)
+        end = self.pos
+        if self.stop_abs is not None:
+            end = min(end, self.stop_abs)
+        end = min(end, rec["wpos"] + (max_n - rec["n"]))
+        lo = max(rec["wpos"] - self.base, self.pre.total - self.pre.size, 0)
+        hi = end - self.base
+        if hi > lo:
+            rec["lost"] += lo - (rec["wpos"] - self.base)
+            data = self.pre.read(lo, hi - lo)
+            buf = np.empty((hi - lo, 2), dtype="<f4")
+            buf[:, 0] = data.real
+            buf[:, 1] = data.imag
+            rec["f"].write(buf.tobytes())
+            rec["n"] += hi - lo
+            rec["wpos"] = self.base + hi
+            db = rec["n"] * 8
+            rec["f"].seek(4)
+            rec["f"].write(struct.pack("<I", 36 + db))
+            rec["f"].seek(40)
+            rec["f"].write(struct.pack("<I", db))
+            rec["f"].seek(0, 2)
+        if rec["n"] >= max_n:
+            self.rearm = True
+            return self._finish("reached maximum length")
+        if self.stop_abs is not None and rec["wpos"] >= self.stop_abs:
+            return self._finish("span back at background")
+        return []
+
+    def _finish(self, reason):
+        rec = self.rec
+        self.rec = None
+        self.stop_abs = None
+        rec["f"].close()
+        t_end = self._wall(rec["wpos"], time.time())
+        info = {
+            "file": os.path.basename(rec["path"]),
+            "format": "WAV, 2 channels, 32-bit IEEE float; left = I, right = Q (complex baseband)",
+            "sample_rate_hz": self.rate,
+            "tune_hz": self.tune_hz,
+            "window_lo_hz": self.tune_hz + self.lo_off,
+            "window_hi_hz": self.tune_hz + self.hi_off,
+            "start_utc": iq_utc(rec["t_start"], iso=True),
+            "carrier_onset_utc": iq_utc(rec["t_onset"], iso=True),
+            "end_utc": iq_utc(t_end, iso=True),
+            "samples": rec["n"],
+            "seconds": rec["n"] / self.rate,
+            "samples_lost": rec["lost"],
+            "ended_by": reason,
+            "trigger": {"on_db": IQ_ON_DB, "off_db": IQ_OFF_DB, "on_min_s": IQ_ON_MIN_S,
+                        "pre_roll_s": IQ_PRE_S, "post_s": IQ_POST_S, "max_s": IQ_MAX_S},
+        }
+        try:
+            with open(rec["base"] + "_info.json", "w") as f:
+                json.dump(info, f, indent=2)
+        except OSError:
+            pass
+        lost = f", {rec['lost']} samples lost" if rec["lost"] else ""
+        return [f"{iq_utc(t_end)} UTC  IQ recording stopped ({reason})  {rec['n'] / self.rate:.2f} s  "
+                f"{os.path.basename(rec['path'])}{lost}"]
+
+
 # ------------------------------------------------------------ GUI
 
 class DecodeWindow(QtWidgets.QWidget):
@@ -3219,6 +3455,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trk_path = None            # CSV file of this Track session
         self.trk_file = None
         self.trk_writer = None
+        self.iq = None                  # IqRecorder while Settings > Record IQ on signal is on
 
         # Decode marks are drawn into the waterfall's own pixel buffer. Each mark records the
         # sample range of its slot, so it scrolls on the same clock as the waterfall rows.
@@ -3391,6 +3628,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.an.set_avg(False)          # startup default: no time average
         self.act_avg.toggled.connect(self.an.set_avg)
         self.settings_menu.addSeparator()
+        self.act_iq = self.settings_menu.addAction("Record IQ on signal")
+        self.act_iq.setCheckable(True)
+        self.act_iq.toggled.connect(self._set_iq)
+        self.settings_menu.addSeparator()
         self.nfft_menu = self.settings_menu.addMenu("FFT size")
         self.nfft_group = QtGui.QActionGroup(self)
         self.nfft_actions = {}
@@ -3547,6 +3788,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, ev):
         self.save_settings()
+        if self.iq is not None:
+            self._iq_log(self.iq.close())
         self._detach_filters()
         super().closeEvent(ev)
 
@@ -3684,6 +3927,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spec_y = None
         if self.cw is not None:
             self.cw.set_window(self.tune_hz, lo, hi)
+        self._iq_window()
 
     def _refresh(self):
         self.off_axis.tune_hz = float(self.tune_hz)     # audio offset is measured from the dial
@@ -4123,6 +4367,29 @@ class MainWindow(QtWidgets.QMainWindow):
         """Clear button on the FT8 stats window: start the per-callsign totals again."""
         self.stats = {}
 
+    # ---- IQ recording: armed from Settings; watches the displayed span, wherever the receiver is tuned
+    def _set_iq(self, on):
+        if on:
+            self.iq = IqRecorder(self.ring, self.rate, os.getcwd())
+            self._iq_window()
+            self.msg.setText("IQ recorder armed: waiting for a signal above the background")
+        else:
+            lines = self.iq.close() if self.iq is not None else []
+            self.iq = None
+            self._iq_log(lines)
+            self.msg.setText("IQ recorder off")
+
+    def _iq_window(self):
+        """Pass the tuning and displayed span to the recorder. A change restarts it."""
+        if self.iq is not None:
+            half = self.span_hz / 2
+            self._iq_log(self.iq.retarget(self.tune_hz, self.disp_off - half, self.disp_off + half))
+
+    def _iq_log(self, lines):
+        for line in lines:
+            self.decode_pane.append(line, False)
+            self.msg.setText(line)
+
     # ---- Settings: FFT size, applied in place
     def _on_nfft_action(self, n):
         """The waterfall and the background average start again. Frequency, span, band and mode are kept."""
@@ -4149,6 +4416,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_paused(self, on):
         self._flush_tracks()            # pausing or resuming ends any transmission in progress
+        if self.iq is not None:
+            self._iq_log(self.iq.restart("receiver stopped" if on else "receiver restarted"))
         self.paused = on
         self.btn_pause.setText("Resume" if on else "Pause")
         if on:
@@ -4681,6 +4950,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._on_cw(rec)
             if self.cw_kind == "FM" and self.fm_plot is not None and self.fm_plot.isVisible():
                 self.fm_plot.update_from(self.cw, self.ring.total)
+        if self.iq is not None:
+            self._iq_log(self.iq.process())
         if self.an.skip_tx:
             self._update_tx_label()
             blk = int(time.time() // NOISE_REPORT_S)
