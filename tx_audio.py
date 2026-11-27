@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-# play a WAV file through the audio device feeding the radio, keying PTT over serial
+
+# Uses NA6D "All-In-One-Cable" to key a radio's PTT line and play a WAV file through the audio device.
+
+# play a WAV file through the audio device feeding the radio, keying PTT over serial (Windows) or CM108 HID (Linux).
 # Requires sounddevice, pyserial, Python 3.6 ... 3.12 with the standard library wave module.
-# J.Beale, 2026-11-25
+
+# On Windows 10, my device required RTS for PTT keying COM10 from Python, DTR did nothing.
+# Linux sees the AIOC providing /dev/ttyACM0, but neither DTR nor RTS worked to generate the PTT signal on ttyACM0.
+# For operation under Linux, I had to use the CM108 HID GPIO pin (GPIO3 on my AIOC) to key the radio.
+
+# J.Beale, 2026-11-26
 
 import argparse
+import os
 import sys
 import time
 import warnings
@@ -16,8 +25,16 @@ import audioop  # stdlib in Python 3.12 and earlier
 import serial
 import sounddevice as sd
 
-PTT_PORT = "COM10"                       # serial port whose RTS line keys the radio
-AUDIO_NAME = "Speakers (AIOC Audio)"     # audio output device feeding the radio
+PTT_METHOD = "CM108" if sys.platform.startswith("linux") else "SERIAL"   # "CM108" (HID GPIO) or "SERIAL"
+assert PTT_METHOD in ("CM108", "SERIAL"), 'PTT_METHOD must be "CM108" or "SERIAL"'
+SERIAL_PTT_PORT = "COM10" if sys.platform == "win32" else "/dev/ttyACM0"
+PTT_LINE = "BOTH"                        # serial line(s) that key the radio: "RTS", "DTR", or "BOTH"
+assert PTT_LINE in ("RTS", "DTR", "BOTH"), 'PTT_LINE must be "RTS", "DTR", or "BOTH"'
+
+CM108_PORT = "/dev/hidraw3"              # AIOC's CM108 HID device (see /sys/class/hidraw/*/device/uevent)
+CM108_GPIO = 3                           # GPIO pin wired to PTT
+PTT_PORT = CM108_PORT if PTT_METHOD == "CM108" else SERIAL_PTT_PORT
+AUDIO_NAME = "Speakers (AIOC Audio)" if sys.platform == "win32" else "All-In-One-Cable"
 API_PREFERENCE = ["Windows WASAPI", "Windows DirectSound", "MME", "Windows WDM-KS"]
 SAMPLE_DTYPES = {1: "uint8", 2: "int16", 3: "int24", 4: "int32"}
 CHUNK_FRAMES = 4096
@@ -30,7 +47,7 @@ def find_target_devices():
     hostapis = sd.query_hostapis()
     found = []
     for idx, dev in enumerate(sd.query_devices()):
-        if dev["name"] == AUDIO_NAME and dev["max_output_channels"] > 0:
+        if AUDIO_NAME in dev["name"] and dev["max_output_channels"] > 0:
             api = hostapis[dev["hostapi"]]["name"]
             rank = API_PREFERENCE.index(api) if api in API_PREFERENCE else len(API_PREFERENCE)
             found.append((rank, idx, api, dev["max_output_channels"]))
@@ -72,6 +89,7 @@ def load_wav(path):
           f"({nframes} frames, {rate} Hz, {wav_ch} ch, {width * 8}-bit)")
     return wav_ch, width, rate, raw
 
+
 def open_audio_stream(wav_ch, width, rate, raw):
     """Create (but do not start) a callback output stream on the first working device.
     Runs before PTT is keyed, so a device failure never transmits."""
@@ -99,10 +117,11 @@ def open_audio_stream(wav_ch, width, rate, raw):
                     raise sd.CallbackStop  # play out what is buffered, then finish
 
             stream = sd.RawOutputStream(samplerate=rate, channels=dev_ch,
-                                        latency="low", blocksize=1024, dtype=SAMPLE_DTYPES[width], device=dev_idx,
-                                        callback=callback, finished_callback=finished.set)  
+                                        latency="low", blocksize=1024, dtype=SAMPLE_DTYPES[width],
+                                        device=dev_idx, callback=callback,
+                                        finished_callback=finished.set)
             print(f"blocksize: {stream.blocksize}")
-            
+
         except sd.PortAudioError as e:
             errors.append(f"{api}: {e}")
             continue
@@ -111,19 +130,65 @@ def open_audio_stream(wav_ch, width, rate, raw):
     sys.exit(f"Could not open {AUDIO_NAME!r}. Errors: " + "; ".join(errors))
 
 
+def set_ptt(ptt, on):
+    """Assert (on=True) or release (on=False) the serial PTT line(s) selected by PTT_LINE."""
+    lines = ("rts", "dtr") if PTT_LINE == "BOTH" else (PTT_LINE.lower(),)
+    for line in lines:
+        setattr(ptt, line, on)
+
+
+class SerialPtt:
+    """Keys the radio by asserting RTS, DTR or both on a serial port."""
+
+    def __init__(self, port):
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.baudrate = BAUD
+        set_ptt(self.ser, False)
+
+    def open(self):
+        self.ser.open()
+
+    def key(self, on):
+        set_ptt(self.ser, on)
+
+    def close(self):
+        self.ser.close()
+
+
+class CM108Ptt:
+    """Keys the radio through a GPIO pin of a CM108-compatible HID device (the AIOC's PTT endpoint)."""
+
+    def __init__(self, path, gpio):
+        self.path = path
+        self.bit = 1 << (gpio - 1)
+        self.fd = None
+
+    def open(self):
+        self.fd = os.open(self.path, os.O_WRONLY)
+        self.key(False)
+
+    def key(self, on):
+        # HID output report: report ID, 0, GPIO data bits, GPIO output-direction mask, 0
+        os.write(self.fd, bytes([0, 0, self.bit if on else 0, self.bit, 0]))
+
+    def close(self):
+        if self.fd is not None:
+            self.key(False)
+            os.close(self.fd)
+            self.fd = None
+
+
 def play_with_ptt(path, pre_delay, post_delay, port):
     wav_ch, width, rate, raw = load_wav(path)
     stream, finished, dev_ch, api = open_audio_stream(wav_ch, width, rate, raw)
 
-
-    ptt = serial.Serial()
-    ptt.port = port
-    ptt.baudrate = BAUD
-    ptt.rts = False
+    ptt = CM108Ptt(port, CM108_GPIO) if PTT_METHOD == "CM108" else SerialPtt(port)
+    ptt_label = f"CM108 GPIO{CM108_GPIO}" if PTT_METHOD == "CM108" else f"serial {PTT_LINE}"
 
     try:
         ptt.open()
-    except serial.SerialException as exc:
+    except (serial.SerialException, OSError) as exc:
         stream.close()
         sys.exit(f"Could not open {port}: {exc}")
 
@@ -131,10 +196,10 @@ def play_with_ptt(path, pre_delay, post_delay, port):
     t_key_up = None
     wav_seconds = len(raw) / (rate * wav_ch * width)
     try:
-        ptt.rts = True  # assert RTS (keys the radio)
+        ptt.key(True)  # assert PTT (keys the radio)
         t_key_down = time.perf_counter()
         time.sleep(pre_delay)
-        print(f"PTT keyed on {port}; playing {path} ({rate} Hz) via {api}")
+        print(f"PTT ({ptt_label}) keyed on {port}; playing {path} ({rate} Hz) via {api}")
         t_start = time.perf_counter()
         stream.start()            # audio starts only after PTT has settled
         print(f"stream latency: {stream.latency:.3f} s")
@@ -144,7 +209,7 @@ def play_with_ptt(path, pre_delay, post_delay, port):
         print(f"stream.start() -> playback done: {t_done - t_start:.3f} s")
         time.sleep(post_delay)
     finally:
-        ptt.rts = False  # unkey even if playback fails or Ctrl+C is pressed
+        ptt.key(False)  # unkey even if playback fails or Ctrl+C is pressed
         t_key_up = time.perf_counter()
         ptt.close()
         stream.close()
@@ -152,12 +217,13 @@ def play_with_ptt(path, pre_delay, post_delay, port):
         if t_key_down is not None:
             print(f"PTT measured: key-down to key-up = {t_key_up - t_key_down:.3f} s")
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Key the radio's PTT over serial, play a WAV file, then unkey.")
+        description="Key the radio's PTT, play a WAV file, then unkey.")
     parser.add_argument("wav", help="path to the WAV file to play")
     parser.add_argument("--port", default=PTT_PORT,
-                        help=f"serial port for PTT (default {PTT_PORT})")
+                        help=f"PTT device: hidraw path for CM108 or serial port for SERIAL (default {PTT_PORT})")
     parser.add_argument("--pre-delay", type=float, default=DEFAULT_PRE_DELAY,
                         help="seconds to hold PTT before audio starts")
     parser.add_argument("--post-delay", type=float, default=DEFAULT_POST_DELAY,
