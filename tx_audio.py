@@ -5,7 +5,7 @@
 # play a WAV file through the audio device feeding the radio, keying PTT over serial (Windows) or CM108 HID (Linux).
 # Requires sounddevice, pyserial, Python 3.6 ... 3.12 with the standard library wave module.
 
-# On Windows 10, my device required RTS for PTT keying COM10 from Python, DTR did nothing.
+# On Windows 10, my device required RTS for PTT keying COM10 from Python. DTR did nothing.
 # Linux sees the AIOC providing /dev/ttyACM0, but neither DTR nor RTS worked to generate the PTT signal on ttyACM0.
 # For operation under Linux, I had to use the CM108 HID GPIO pin (GPIO3 on my AIOC) to key the radio.
 
@@ -25,10 +25,11 @@ import audioop  # stdlib in Python 3.12 and earlier
 import serial
 import sounddevice as sd
 
+VERSION = "0.2.1"
 PTT_METHOD = "CM108" if sys.platform.startswith("linux") else "SERIAL"   # "CM108" (HID GPIO) or "SERIAL"
 assert PTT_METHOD in ("CM108", "SERIAL"), 'PTT_METHOD must be "CM108" or "SERIAL"'
 SERIAL_PTT_PORT = "COM10" if sys.platform == "win32" else "/dev/ttyACM0"
-PTT_LINE = "BOTH"                        # serial line(s) that key the radio: "RTS", "DTR", or "BOTH"
+PTT_LINE = "RTS"                        # serial line(s) that key the radio: "RTS", "DTR", or "BOTH"
 assert PTT_LINE in ("RTS", "DTR", "BOTH"), 'PTT_LINE must be "RTS", "DTR", or "BOTH"'
 
 CM108_PORT = "/dev/hidraw3"              # AIOC's CM108 HID device (see /sys/class/hidraw/*/device/uevent)
@@ -203,7 +204,10 @@ def play_with_ptt(path, pre_delay, post_delay, port):
         t_start = time.perf_counter()
         stream.start()            # audio starts only after PTT has settled
         print(f"stream latency: {stream.latency:.3f} s")
-        finished.wait()           # set by PortAudio once playback has really ended
+        # finished.wait() is set by PortAudio once playback has really ended
+        while not finished.wait(0.1):   # timed waits let Ctrl-C work to exit program (isn't needed in Linux)
+            pass
+
         t_done = time.perf_counter()
         print(f"keyed -> stream.start(): {t_start - t_key_down:.3f} s")
         print(f"stream.start() -> playback done: {t_done - t_start:.3f} s")
