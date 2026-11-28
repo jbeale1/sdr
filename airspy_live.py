@@ -21,7 +21,7 @@ to the decodes pane and to track_YYYYmmdd_HHMMSS.csv in the current directory.
 The Settings menu holds raw/SNR display, time average and the FFT size. Changing the FFT
 size takes effect at once; the waterfall and background average start again.
 
--J.Beale N8JUF  25-Nov-2026
+-J.Beale N8JUF  27-Nov-2026
 
 Examples:
     ./airspy_live.py                              # 14.074 MHz, 14074-14077 kHz, 192 kS/s
@@ -57,7 +57,7 @@ import scipy.special as sspec
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-VERSION = "0.43.0"
+VERSION = "0.43.3"
 DEFAULT_FREQ_MHZ = 14.074
 DEFAULT_LO_KHZ = 14074.0        # default display window when no display option is given
 DEFAULT_HI_KHZ = 14077.0
@@ -1516,6 +1516,11 @@ def fm_trans3(p_sw):
                      [bad, lsw, lstay]])
 
 
+# Carry the last committed state across the 2-state and 3-state models, which alternate as the carrier levels are refitted
+FM_PREV_2_FROM_3 = {0: 0, 1: 0, 2: 1}     # OFF, UP -> key up; DOWN -> key down
+FM_PREV_3_FROM_2 = {0: 1, 1: 2}           # key up -> UP (carrier on); key down -> DOWN
+
+
 def fm_viterbi(e, trans, prev):
     """Most likely state for each frame, given log-emissions e (frames by states) and a log transition
     matrix. prev is the state before the first frame."""
@@ -1551,6 +1556,7 @@ class FmDecoder(CwDecoder):
         self.mu = None           # (key-up mean, key-down mean, key-up sd, key-down sd), dB; None until seen
         self.vit = []            # (centre, linear power) frames not yet committed
         self.prev = 0            # state of the last committed frame
+        self.prev_model = 2      # model that produced self.prev: 2 (key up/down) or 3 (OFF/UP/DOWN)
         self.aux_mu = None       # carrier dB: (OFF mean, OFF sd, UP mean, UP sd, DOWN mean, DOWN sd) or None
         self.spec_q = {}         # frame centre -> (first bin, spectrum slice), until the frame is committed
         self.spec_half = int(FM_SPEC_HALF_HZ / float(self.freqs[1] - self.freqs[0]))
@@ -1634,6 +1640,8 @@ class FmDecoder(CwDecoder):
         comb = [10.0 * math.log10(env + 1e-30) for _, env, _ in self.vit]
         nd = float("nan") if self.noise_db is None else self.noise_db
         three = FM_FEATURE == "carrier3" and self.aux_mu is not None
+        model = 3 if three else 2
+        prev = self._prev_state(model)
         if self.mu is None:                          # held too long without levels: call it key up
             x = comb
             path = np.zeros(len(x), dtype=np.int64)
@@ -1650,13 +1658,13 @@ class FmDecoder(CwDecoder):
             e[:, 0] = lk0 + fm_gauss(c, off_mu, off_sd)
             e[:, 1] = lk0 + fm_gauss(c, up_mu, up_sd)
             e[:, 2] = lk1 + fm_gauss(c, dn_mu, dn_sd)
-            path = fm_viterbi(e, fm_trans3(FM_SWITCH_P), self.prev)
+            path = fm_viterbi(e, fm_trans3(FM_SWITCH_P), prev)
             mid = 0.5 * (mu0 + mu1)
             down = 2
         else:
             mu0, mu1, s0, s1 = self.mu
             x = self._features()
-            path = fm_viterbi(fm_loglik(x, mu0, s0, mu1, s1), fm_trans2(FM_SWITCH_P), self.prev)
+            path = fm_viterbi(fm_loglik(x, mu0, s0, mu1, s1), fm_trans2(FM_SWITCH_P), prev)
             mid = 0.5 * (mu0 + mu1)
             down = 1
         for i in range(n_commit):
@@ -1667,11 +1675,18 @@ class FmDecoder(CwDecoder):
                 self._add_spec(center)
             self.trace.append((center, x[i], mid, nd, on, mu0, mu1))
             self.prev = state
+            self.prev_model = model
             rec = self._step(center, env, on, total, now)
             if rec is not None:
                 out.append(rec)
         del self.vit[:n_commit]
         return out
+
+    def _prev_state(self, model):
+        """Last committed state, expressed in the model about to run."""
+        if self.prev_model == model:
+            return self.prev
+        return FM_PREV_3_FROM_2[self.prev] if model == 3 else FM_PREV_2_FROM_3[self.prev]
 
     def _features(self):
         """Level of each queued frame in dB, key down high: the comb level, or comb minus carrier."""
@@ -2638,9 +2653,9 @@ IQ_FLOOR_TAU_S = 10.0           # background level follows slow changes over abo
 IQ_ON_DB = 10.0                 # a peak this far above the background starts a recording
 IQ_OFF_DB = 4.0                 # below this the span counts as background again
 IQ_ON_MIN_S = 0.05              # the peak must stay above IQ_ON_DB this long
-IQ_PRE_S = 0.5                  # written before the carrier first rises above the background
-IQ_POST_S = 1.0                 # written after the span returns to background
-IQ_MAX_S = 120.0                # longest single recording
+IQ_PRE_S = 0.25                  # written before the carrier first rises above the background
+IQ_POST_S = 0.25                 # written after the span returns to background
+IQ_MAX_S = 600.0                # longest single-transmission recording allowed
 
 
 def iq_utc(t, iso=False):
@@ -2861,6 +2876,210 @@ class IqRecorder:
             pass
         lost = f", {rec['lost']} samples lost" if rec["lost"] else ""
         return [f"{iq_utc(t_end)} UTC  IQ recording stopped ({reason})  {rec['n'] / self.rate:.2f} s  "
+                f"{os.path.basename(rec['path'])}{lost}"]
+
+
+# ---- Audio recording: same trigger as the IQ recorder, but the file holds the demodulated audio
+
+AUD_RATE = 48000                 # output sample rate, samples/s
+AUD_HALF_HZ = 10000.0            # channel is 20 kHz wide, centred on the carrier
+AUD_TAPS = 255                   # channel low-pass taps at the receiver rate
+AUD_HPF_HZ = 300.0               # 4th-order Butterworth high-pass on the audio: nothing of the signal lies below 300 Hz
+AUD_HPF_SOS = ssig.butter(4, AUD_HPF_HZ, btype="highpass", fs=AUD_RATE, output="sos")
+AUD_FULL_SCALE_HZ = 16000.0      # 16-bit file: +/-16 kHz deviation is full scale
+
+
+def wav_pcm16_header(rate, data_bytes):
+    """44-byte WAV header: mono, 16-bit PCM."""
+    return struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + data_bytes, b"WAVE", b"fmt ",
+                       16, 1, 1, rate, rate * 2, 2, 16, b"data", data_bytes)
+
+
+class AudioRecorder(IqRecorder):
+    """Same trigger, pre-roll and stop rules as IqRecorder. The receiver's IQ is demodulated continuously: the
+    carrier is followed by a numerically controlled oscillator, a 20 kHz channel is low-pass filtered and
+    decimated to AUD_RATE, and the FM discriminator and a 20 Hz high-pass give the audio. Only the audio is
+    written, as a mono 16-bit WAV, with no de-emphasis."""
+
+    def __init__(self, ring, rate, outdir):
+        self.dec = int(round(rate / AUD_RATE))
+        self.lpf = ssig.firwin(AUD_TAPS, AUD_HALF_HZ, fs=rate)
+        self.manual = False              # Rec button: record continuously, ignoring the signal trigger
+        super().__init__(ring, rate, outdir)
+
+    def restart(self, reason):
+        lines = super().restart(reason)
+        self.iq_done = 0                                         # IQ samples in self.pre already demodulated
+        self.zi = np.zeros(AUD_TAPS - 1, dtype=np.complex128)    # channel filter state
+        self.hpf_zi = np.zeros((AUD_HPF_SOS.shape[0], 2))
+        self.nco_hz = 0.0                                        # channel centre, Hz from the tuning frequency
+        self.nco_ph = 0.0
+        self.peak_hz = None                                      # carrier estimate, set while the carrier is on
+        self.last = None                                         # previous decimated sample, for the discriminator
+        self.a_pre = RingBuffer(int((IQ_PRE_S + 3.0) * AUD_RATE) + 1)   # audio pre-roll, samples
+        return lines
+
+    def _frame(self, Pi, fc, now, out):
+        super()._frame(Pi, fc, now, out)
+        if self.manual:
+            self.stop_abs = None         # Rec: no signal-based stop point
+            if self.rec is None:
+                self._open(fc, now, out, manual=True)
+        if self.ema is None or self.s_floor is None or self.mask is None:
+            return
+        e = 10.0 * np.log10(self.ema + 1e-30)
+        if float(e.max() - np.median(e)) - self.s_floor <= IQ_ON_DB:
+            return
+        k = int(np.argmax(self.ema))
+        frac = 0.0
+        if 0 < k < len(self.ema) - 1:                            # parabolic refinement of the peak bin
+            a, b, c = self.ema[k - 1], self.ema[k], self.ema[k + 1]
+            den = a - 2.0 * b + c
+            if den != 0:
+                frac = float(np.clip(0.5 * (a - c) / den, -0.5, 0.5))
+        df = float(self.freqs[1] - self.freqs[0])
+        self.peak_hz = float(self.freqs[self.mask][k] + frac * df)
+
+    def _a_index(self, abs_idx):
+        """Audio sample index of a ring sample index."""
+        return max(0, int((abs_idx - self.base) // self.dec))
+
+    def _demod_new(self):
+        """Demodulate the IQ samples received since the last call and push the audio to the pre-roll."""
+        n_new = self.pre.total - self.iq_done
+        if n_new <= 0:
+            return
+        x = self.pre.read(self.iq_done, n_new)
+        if x is None:
+            return
+        if self.peak_hz is not None:
+            self.nco_hz = self.peak_hz
+        dphi = 2.0 * math.pi * self.nco_hz / self.rate
+        th = self.nco_ph + dphi * np.arange(n_new)
+        self.nco_ph = float((self.nco_ph + dphi * n_new) % (2.0 * math.pi))
+        m = x.astype(np.complex128) * np.exp(-1j * th)
+        z, self.zi = ssig.lfilter(self.lpf, [1.0], m, zi=self.zi)
+        start = (-self.iq_done) % self.dec                       # keep every dec-th IQ sample, counted from restart
+        zd = z[start::self.dec]
+        self.iq_done += n_new
+        if zd.size == 0:
+            return
+        scale = AUD_RATE / (2.0 * math.pi)
+        if self.last is None:
+            f = np.angle(zd[1:] * np.conj(zd[:-1])) * scale
+            f = np.concatenate([[0.0], f])                       # first kept sample has no predecessor
+        else:
+            zz = np.concatenate([[self.last], zd])
+            f = np.angle(zz[1:] * np.conj(zz[:-1])) * scale
+        self.last = zd[-1]
+        y, self.hpf_zi = ssig.sosfilt(AUD_HPF_SOS, f, zi=self.hpf_zi)
+        self.a_pre.push(y.astype(np.complex64))
+
+    def _writes(self):
+        self._demod_new()
+        return self._write_audio()
+
+    def _open(self, onset, now, out, manual=False):
+        """Start a recording with AUD pre-roll: IQ_PRE_S before the onset, as far as the buffer holds it.
+        A manual recording (Rec button) starts at the onset with no pre-roll."""
+        j_on = self._a_index(onset)
+        j_pre = 0 if manual else int(IQ_PRE_S * AUD_RATE)
+        oldest = max(0, self.a_pre.total - self.a_pre.size)
+        start = max(j_on - j_pre, oldest)
+        t_start = self._wall(self.base + start * self.dec, now)
+        t_on = self._wall(onset, now)
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime(t_start))
+        base = os.path.join(self.outdir, f"audio_{stamp}_{self.tune_hz / 1e3:.0f}kHz")
+        path = base + ".wav"
+        f = open(path, "wb")
+        f.write(wav_pcm16_header(AUD_RATE, 0))
+        self.rec = {"f": f, "path": path, "base": base, "wpos": start, "n": 0, "lost": 0,
+                    "t_start": t_start, "t_onset": t_on, "manual": manual}
+        out.append(f"{iq_utc(t_start)} UTC  audio recording started  {self.tune_hz / 1e6:.4f} MHz  "
+                   f"carrier at {iq_utc(t_on)}  -> {os.path.basename(path)}")
+
+    def set_manual(self, on):
+        """Rec button. On: a recording starts now and runs until Rec is turned off, whatever the signal does.
+        Off: the audio up to now is written and the recording closed. Returns log lines."""
+        if on:
+            self.manual = True
+            return []
+        lines = self.process()           # everything received up to the click, while Rec still holds the file open
+        self.manual = False
+        self._demod_new()
+        lines += self._write_audio()
+        if self.rec is not None:
+            lines += self._finish("Rec off")
+        return lines
+
+    def _write_audio(self):
+        """Write the audio due so far: up to the newest sample, or to the stop point. Returns log lines."""
+        rec = self.rec
+        if rec is None:
+            return []
+        max_n = int(IQ_MAX_S * AUD_RATE)
+        stop_a = None if self.stop_abs is None else self._a_index(self.stop_abs)
+        end = self.a_pre.total
+        if stop_a is not None:
+            end = min(end, stop_a)
+        end = min(end, rec["wpos"] + (max_n - rec["n"]))
+        lo = max(rec["wpos"], self.a_pre.total - self.a_pre.size, 0)
+        hi = end
+        if hi > lo:
+            rec["lost"] += lo - rec["wpos"]
+            data = self.a_pre.read(lo, hi - lo)
+            if data is not None:
+                pcm = np.round(np.clip(data.real / AUD_FULL_SCALE_HZ, -1.0, 1.0) * 32767).astype("<i2")
+                rec["f"].write(pcm.tobytes())
+                rec["n"] += hi - lo
+                rec["wpos"] = hi
+                db = rec["n"] * 2
+                rec["f"].seek(4)
+                rec["f"].write(struct.pack("<I", 36 + db))
+                rec["f"].seek(40)
+                rec["f"].write(struct.pack("<I", db))
+                rec["f"].seek(0, 2)
+        if rec["n"] >= max_n:
+            self.rearm = True
+            return self._finish("reached maximum length")
+        if stop_a is not None and rec["wpos"] >= stop_a:
+            return self._finish("span back at background")
+        return []
+
+    def _finish(self, reason):
+        rec = self.rec
+        self.rec = None
+        self.stop_abs = None
+        rec["f"].close()
+        t_end = self._wall(self.base + rec["wpos"] * self.dec, time.time())
+        info = {
+            "file": os.path.basename(rec["path"]),
+            "format": f"WAV, mono, 16-bit PCM; full scale = +/-{AUD_FULL_SCALE_HZ / 1e3:g} kHz deviation of the demodulated FM",            
+            "sample_rate_hz": AUD_RATE,
+            "tune_hz": self.tune_hz,
+            "carrier_hz_from_tuning": self.peak_hz,
+            "channel": "20 kHz centred on the carrier (FIR low-pass at +/-10 kHz), decimated from the receiver rate",
+            "de_emphasis": "none",
+            "audio_highpass_hz": AUD_HPF_HZ,
+            "full_scale_deviation_hz": AUD_FULL_SCALE_HZ,
+            "started_by": "Rec button" if rec["manual"] else "signal trigger",
+            "start_utc": iq_utc(rec["t_start"], iso=True),
+            "carrier_onset_utc": iq_utc(rec["t_onset"], iso=True),
+            "end_utc": iq_utc(t_end, iso=True),
+            "samples": rec["n"],
+            "seconds": rec["n"] / AUD_RATE,
+            "samples_lost": rec["lost"],
+            "ended_by": reason,
+            "trigger": {"on_db": IQ_ON_DB, "off_db": IQ_OFF_DB, "on_min_s": IQ_ON_MIN_S,
+                        "pre_roll_s": IQ_PRE_S, "post_s": IQ_POST_S, "max_s": IQ_MAX_S},
+        }
+        try:
+            with open(rec["base"] + "_info.json", "w") as f:
+                json.dump(info, f, indent=2)
+        except OSError:
+            pass
+        lost = f", {rec['lost']} samples lost" if rec["lost"] else ""
+        return [f"{iq_utc(t_end)} UTC  audio recording stopped ({reason})  {rec['n'] / AUD_RATE:.2f} s  "
                 f"{os.path.basename(rec['path'])}{lost}"]
 
 
@@ -3456,6 +3675,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trk_file = None
         self.trk_writer = None
         self.iq = None                  # IqRecorder while Settings > Record IQ on signal is on
+        self.aud = None                 # AudioRecorder while Settings > Record audio on signal is on
 
         # Decode marks are drawn into the waterfall's own pixel buffer. Each mark records the
         # sample range of its slot, so it scrolls on the same clock as the waterfall rows.
@@ -3613,6 +3833,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_pause.setCheckable(True)
         self.btn_pause.toggled.connect(self._set_paused)
         controls.addWidget(self.btn_pause)
+        self.btn_arm = QtWidgets.QPushButton("Arm rec")
+        self.btn_arm.setCheckable(True)
+        self.btn_arm.setToolTip("Record audio when a signal appears (same as Settings > Record audio on signal)")
+        self.btn_rec = QtWidgets.QPushButton("Rec")
+        self.btn_rec.setCheckable(True)
+        self.btn_rec.setToolTip("Record audio now, until Rec is clicked again")
+        self.btn_rec.setStyleSheet("QPushButton:checked { background-color: #b03030; color: white; }")
+        controls.addWidget(self.btn_arm)
+        controls.addWidget(self.btn_rec)
         controls.addWidget(self.btn_save)
         controls.addWidget(self.mode_btn)
         controls.addWidget(self.btn_marks)
@@ -3631,6 +3860,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_iq = self.settings_menu.addAction("Record IQ on signal")
         self.act_iq.setCheckable(True)
         self.act_iq.toggled.connect(self._set_iq)
+        self.act_aud = self.settings_menu.addAction("Record audio on signal")
+        self.act_aud.setCheckable(True)
+        self.act_aud.toggled.connect(self._set_audio)
         self.settings_menu.addSeparator()
         self.nfft_menu = self.settings_menu.addMenu("FFT size")
         self.nfft_group = QtGui.QActionGroup(self)
@@ -3661,6 +3893,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_exit.clicked.connect(self.exit_app)
         self.btn_marks.toggled.connect(self._set_marks_visible)
         self.btn_calls.toggled.connect(self._set_calls_visible)
+        self.btn_arm.toggled.connect(self.act_aud.setChecked)       # Arm rec and the menu item are one setting
+        self.act_aud.toggled.connect(self.btn_arm.setChecked)
+        self.btn_rec.toggled.connect(self._set_rec)
         self.act_raw.toggled.connect(self._on_raw_toggled)
         self.spec.setLabel("left", "Power" if self.act_raw.isChecked() else "SNR", units="dB")
 
@@ -3790,6 +4025,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.save_settings()
         if self.iq is not None:
             self._iq_log(self.iq.close())
+        if self.aud is not None:
+            self._iq_log(self.aud.close())
         self._detach_filters()
         super().closeEvent(ev)
 
@@ -4379,11 +4616,60 @@ class MainWindow(QtWidgets.QMainWindow):
             self._iq_log(lines)
             self.msg.setText("IQ recorder off")
 
+    def _ensure_audio(self):
+        """Make sure the audio recorder exists. Returns an error message, or None."""
+        if self.aud is not None:
+            return None
+        ratio = self.rate / AUD_RATE
+        if abs(ratio - round(ratio)) > 1e-9:
+            return f"audio recording needs a receiver rate that is a multiple of {AUD_RATE // 1000} kHz"
+        self.aud = AudioRecorder(self.ring, self.rate, os.getcwd())
+        self._iq_window()
+        return None
+
+    def _close_audio(self, text):
+        lines = self.aud.close() if self.aud is not None else []
+        self.aud = None
+        self._iq_log(lines)
+        self.msg.setText(text)
+
+    def _set_audio(self, on):
+        if on:
+            err = self._ensure_audio()
+            if err:
+                self.act_aud.setChecked(False)           # the toggle handler runs again with off, then this message stays
+                self.msg.setText(err)
+                return
+            self.msg.setText("audio recorder armed: waiting for a signal above the background")
+        elif self.aud is not None and self.aud.manual:
+            self.msg.setText("audio recorder disarmed; Rec keeps recording")
+        else:
+            self._close_audio("audio recorder off")
+
+    def _set_rec(self, on):
+        """Rec button: record audio now, until clicked again. Shares the audio recorder with Arm rec."""
+        if on:
+            err = self._ensure_audio()
+            if err:
+                self.btn_rec.setChecked(False)
+                self.msg.setText(err)
+                return
+            self._iq_log(self.aud.set_manual(True))
+            self.msg.setText("recording audio until Rec is clicked again")
+        elif self.aud is not None:
+            self._iq_log(self.aud.set_manual(False))
+            if self.act_aud.isChecked():
+                self.msg.setText("Rec off: audio recorder still armed")
+            else:
+                self._close_audio("Rec off")
+
     def _iq_window(self):
-        """Pass the tuning and displayed span to the recorder. A change restarts it."""
+        """Pass the tuning and displayed span to the recorders. A change restarts them."""
+        half = self.span_hz / 2
         if self.iq is not None:
-            half = self.span_hz / 2
             self._iq_log(self.iq.retarget(self.tune_hz, self.disp_off - half, self.disp_off + half))
+        if self.aud is not None:
+            self._iq_log(self.aud.retarget(self.tune_hz, self.disp_off - half, self.disp_off + half))
 
     def _iq_log(self, lines):
         for line in lines:
@@ -4418,6 +4704,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flush_tracks()            # pausing or resuming ends any transmission in progress
         if self.iq is not None:
             self._iq_log(self.iq.restart("receiver stopped" if on else "receiver restarted"))
+        if self.aud is not None:
+            self._iq_log(self.aud.restart("receiver stopped" if on else "receiver restarted"))
         self.paused = on
         self.btn_pause.setText("Resume" if on else "Pause")
         if on:
@@ -4952,6 +5240,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.fm_plot.update_from(self.cw, self.ring.total)
         if self.iq is not None:
             self._iq_log(self.iq.process())
+        if self.aud is not None:
+            self._iq_log(self.aud.process())
         if self.an.skip_tx:
             self._update_tx_label()
             blk = int(time.time() // NOISE_REPORT_S)
@@ -5174,4 +5464,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
